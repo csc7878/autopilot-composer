@@ -1,0 +1,13 @@
+{ 
+  "task_name": "long_flow_auto_task", 
+  "max_retry": 3, 
+  "delay_base": 1.2, 
+  "log_level": "INFO", 
+  "save_breakpoint_path": "./breakpoint.json", 
+  "log_save_path": "./run_log.log", 
+  "snapshot_err_path": "./error_img/", 
+  "run_mode": "background", 
+  "browser_cdp_port": 9222, 
+  "gui_safe_mode": true,
+  "task_flow_path": "./task_flow.json"
+} 

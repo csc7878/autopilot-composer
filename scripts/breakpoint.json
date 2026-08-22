@@ -1,0 +1,8 @@
+{ 
+  "current_step": 0, 
+  "total_step": 100, 
+  "task_status": "stop", 
+  "last_run_time": "", 
+  "err_msg": "", 
+  "step_cache": {} 
+} 

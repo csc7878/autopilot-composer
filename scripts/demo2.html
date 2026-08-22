@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>APC 自带浏览器验证页</title></head>
+<body>
+  <h2>AutoPilot Composer 自带浏览器演示</h2>
+  <p>这是一个用于验证「预置元素库 + 录制回放」的演示页面。</p>
+  <input id="kw" name="wd" placeholder="输入关键词" />
+  <button id="su" type="button" onclick="doSearch()">搜索</button>
+  <div id="status">未操作</div>
+  <script>
+    function doSearch(){
+      var v = document.getElementById('kw').value;
+      document.getElementById('status').textContent = '已点击，输入内容：' + v;
+    }
+  </script>
+</body>
+</html>

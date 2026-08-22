@@ -1,0 +1,100 @@
+{
+  "_meta": {
+    "name": "AutoPilot Composer 预置元素库",
+    "version": "1.0",
+    "note": "针对常见站点预置多策略定位器。录制/回放时优先命中，命中后动作自动带上 element_ref，页面改版只需改这里。",
+    "priority_web": ["id", "name", "placeholder", "role+label", "testid", "css"]
+  },
+  "web": {
+    "baidu_search_input": {
+      "name": "百度搜索框",
+      "domain": "www.baidu.com",
+      "tags": ["baidu", "search"],
+      "locators": [
+        {"strategy": "id", "query": "#kw"},
+        {"strategy": "name", "query": "input[name=\"wd\"]"},
+        {"strategy": "placeholder", "query": "input[placeholder=\"输入关键词\"]"},
+        {"strategy": "css", "query": "#form input#kw"}
+      ]
+    },
+    "baidu_search_btn": {
+      "name": "百度搜索按钮",
+      "domain": "www.baidu.com",
+      "tags": ["baidu", "search"],
+      "locators": [
+        {"strategy": "id", "query": "#su"},
+        {"strategy": "css", "query": "input[type=\"submit\"]"}
+      ]
+    },
+    "github_search_input": {
+      "name": "GitHub 搜索框",
+      "domain": "github.com",
+      "tags": ["github", "search"],
+      "locators": [
+        {"strategy": "name", "query": "input[name=\"q\"]"},
+        {"strategy": "placeholder", "query": "input[placeholder=\"Search or jump to\"]"},
+        {"strategy": "css", "query": "#query-builder, input[type=\"search\"]"}
+      ]
+    },
+    "github_login_link": {
+      "name": "GitHub 登录链接",
+      "domain": "github.com",
+      "tags": ["github", "login"],
+      "locators": [
+        {"strategy": "css", "query": "a[href=\"/login\"]"},
+        {"strategy": "css", "query": "a:contains(\"Sign in\")"}
+      ]
+    },
+    "google_search_input": {
+      "name": "Google 搜索框",
+      "domain": "www.google.com",
+      "tags": ["google", "search"],
+      "locators": [
+        {"strategy": "name", "query": "input[name=\"q\"]"},
+        {"strategy": "css", "query": "textarea[name=\"q\"], input[name=\"q\"]"},
+        {"strategy": "aria", "query": "textarea[aria-label=\"Search\"]"}
+      ]
+    },
+    "bing_search_input": {
+      "name": "Bing 搜索框",
+      "domain": "www.bing.com",
+      "tags": ["bing", "search"],
+      "locators": [
+        {"strategy": "id", "query": "#sb_form_q"},
+        {"strategy": "name", "query": "input[name=\"q\"]"},
+        {"strategy": "css", "query": "textarea#sb_form_q, input#sb_form_q"}
+      ]
+    },
+    "generic_submit_btn": {
+      "name": "通用提交按钮（登录/确认）",
+      "domain": "*",
+      "tags": ["generic", "submit", "login"],
+      "locators": [
+        {"strategy": "css", "query": "button[type=\"submit\"]"},
+        {"strategy": "css", "query": "input[type=\"submit\"]"},
+        {"strategy": "role+label", "query": "button[role=\"button\"]"}
+      ]
+    },
+    "generic_username": {
+      "name": "通用用户名输入框",
+      "domain": "*",
+      "tags": ["generic", "login", "user"],
+      "locators": [
+        {"strategy": "id", "query": "#username, #user, #login, #email, #account"},
+        {"strategy": "name", "query": "input[name=\"username\"], input[name=\"user\"], input[name=\"email\"], input[name=\"login\"]"},
+        {"strategy": "placeholder", "query": "input[placeholder*=\"用户名\"], input[placeholder*=\"邮箱\"], input[placeholder*=\"账号\"]"},
+        {"strategy": "css", "query": "input[type=\"text\"], input[type=\"email\"]"}
+      ]
+    },
+    "generic_password": {
+      "name": "通用密码输入框",
+      "domain": "*",
+      "tags": ["generic", "login", "password"],
+      "locators": [
+        {"strategy": "id", "query": "#password, #pwd, #pass"},
+        {"strategy": "name", "query": "input[name=\"password\"], input[name=\"pwd\"]"},
+        {"strategy": "css", "query": "input[type=\"password\"]"}
+      ]
+    }
+  }
+}

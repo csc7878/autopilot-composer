@@ -1,0 +1,26 @@
+[
+  {
+    "_comment": "打开本地 demo 页面（请改成你本机 demo.html 的实际路径）",
+    "type": "browser",
+    "func": "open_url",
+    "args": ["file:///C:/path/to/autopilot-composer-3.1.0/scripts/demo.html"]
+  },
+  {
+    "_comment": "在 id=kw 的输入框中写入文本",
+    "type": "browser",
+    "func": "input_text",
+    "args": ["#kw", "AutoPilot Composer 你好"]
+  },
+  {
+    "_comment": "点击 id=go 的按钮",
+    "type": "browser",
+    "func": "click_elem",
+    "args": ["#go"]
+  },
+  {
+    "_comment": "截图留痕",
+    "type": "browser",
+    "func": "screenshot",
+    "args": ["./demo_result.png"]
+  }
+]

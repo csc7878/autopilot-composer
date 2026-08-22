@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <title>AutoPilot Composer Demo</title>
+  <style>
+    body { font-family: -apple-system, "Microsoft YaHei", sans-serif; padding: 40px; background: #f5f7fa; }
+    h1 { color: #2c3e50; }
+    #kw { padding: 8px 12px; font-size: 16px; width: 320px; }
+    #go { padding: 8px 18px; font-size: 16px; cursor: pointer; }
+    #status { margin-top: 20px; font-size: 18px; color: #1a73e8; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>AutoPilot Composer 本地测试页</h1>
+  <input id="kw" type="text" placeholder="在此输入文本" />
+  <button id="go">点击我</button>
+  <div id="status">未操作</div>
+  <script>
+    document.getElementById('go').addEventListener('click', function () {
+      var v = document.getElementById('kw').value;
+      document.getElementById('status').textContent = '已点击，输入内容：' + v;
+    });
+  </script>
+</body>
+</html>

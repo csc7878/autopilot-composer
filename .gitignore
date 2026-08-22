@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+recordings/
+_e2e_preset/
+_e2e_upgrade/
+*.log
