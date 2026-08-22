@@ -18,6 +18,7 @@ import os
 import sys
 import time
 import json
+import tempfile
 import shutil
 import subprocess
 import urllib.request
@@ -99,11 +100,18 @@ def launch(port=9222, open_url=None, headless=False, profile_dir=None,
             "C:\\Users\\Administrator\\.workbuddy\\binaries\\chrome\\chrome.exe"
         )
 
+    # reuse=False 时若端口被占用，自动递增找一个空闲端口，避免旧实例冲突
+    if not reuse:
+        while port_alive(port):
+            port += 1
+            if port > 9999:
+                raise RuntimeError("找不到可用调试端口（9222-9999 均被占用）")
+
     if profile_dir is None:
-        profile_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..", "browser_profile"
-        )
+        # 用系统临时目录，避免项目路径下的锁定/权限问题
+        base = os.path.join(tempfile.gettempdir(), "apc_chrome_profile")
+        os.makedirs(base, exist_ok=True)
+        profile_dir = os.path.join(base, "p_%d" % port)
     profile_dir = os.path.abspath(profile_dir)
     os.makedirs(profile_dir, exist_ok=True)
 
@@ -125,7 +133,7 @@ def launch(port=9222, open_url=None, headless=False, profile_dir=None,
     if sys.platform.startswith("win"):
         proc = subprocess.Popen(
             args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=0x00000008,  # CREATE_NO_WINDOW
+            creationflags=0x00000200,  # CREATE_NEW_PROCESS_GROUP（后台分离，避免被父进程误回收）
         )
     else:
         proc = subprocess.Popen(

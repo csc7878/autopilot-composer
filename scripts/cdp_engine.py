@@ -131,22 +131,24 @@ class CdpBrowserCtrl:
 
     def _probe(self, selector):
         """探测元素：返回 {count, x, y, found}。同时支持 CSS 与 XPath。"""
-        if is_xpath(selector):
+        use_xpath = is_xpath(selector)
+        if use_xpath:
             cnt = ('document.evaluate(%r,document,null,'
                    'XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,null).snapshotLength' % selector)
+            node = ('document.evaluate(%r,document,null,'
+                    'XPathResult.FIRST_ORDERED_NODE_TYPE,null).singleNodeValue' % selector)
         else:
             cnt = "document.querySelectorAll(%r).length" % selector
+            node = "document.querySelectorAll(%r)[0]" % selector
         js = (
             "(() => {"
-            "  var els = %s;"
-            "  if (typeof els === 'number') { var count = els; var el = count>0 ? "
-            "(document.evaluate(%r,document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null).singleNodeValue) : null; }"
-            "  else { var count = els.length; var el = els[0] || null; }"
+            "  var count = %s;"
+            "  var el = %s;"
             "  if (!el) return {count:0, x:0, y:0, found:false};"
             "  var r = el.getBoundingClientRect();"
             "  return {count: count, x: r.left + r.width/2, y: r.top + r.height/2, found:true};"
             "})()"
-        ) % (cnt, selector)
+        ) % (cnt, node)
         res = self.send_cmd(
             "Runtime.evaluate", {"expression": js, "returnByValue": True}
         )
