@@ -4,3 +4,8 @@ recordings/
 _e2e_preset/
 _e2e_upgrade/
 *.log
+bp2/
+bp3/
+bp4/
+browser_profile/
+recordings/
