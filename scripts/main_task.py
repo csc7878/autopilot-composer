@@ -193,9 +193,15 @@ class BreakPointTaskRunner:
     def start_run(self):
         task_flow = self.load_task_flow()
         start_idx = self.break_data["current_step"]
-        logging.info("断点续跑启动，起始步骤：%d" % start_idx)
+        if start_idx > 0:
+            print("⏯ 断点续跑：从步骤 %d/%d 继续" % (start_idx, len(task_flow)))
+        else:
+            print("▶ 开始回放：共 %d 步" % len(task_flow))
 
         for idx in range(start_idx, len(task_flow)):
+            step = task_flow[idx]
+            desc = step.get("func", step.get("type", "?"))
+            args_preview = ", ".join(str(a) for a in step.get("args", []))[:40]
             retry = 0
             success = False
             err_info = ""
@@ -204,6 +210,7 @@ class BreakPointTaskRunner:
                     self.run_single_step(task_flow[idx])
                     success = True
                     self.save_breakpoint(idx + 1, "running")
+                    print("  ✅ 步骤 %d/%d  [%s %s]" % (idx + 1, len(task_flow), desc, args_preview))
                     time.sleep(self.cfg["delay_base"])
                     logging.info("步骤%d执行成功" % idx)
                     break
@@ -211,17 +218,29 @@ class BreakPointTaskRunner:
                     retry += 1
                     err_info = "步骤%d异常：%s" % (idx, str(e))
                     logging.error(err_info)
+                    print("  ⚠️ 步骤 %d/%d  [%s] 重试 %d/%d：%s"
+                          % (idx + 1, len(task_flow), desc, retry, self.max_retry, str(e)[:60]))
                     time.sleep(2)
             if not success:
                 self.save_breakpoint(idx, "error", err_info)
                 self.oplog.save()
-                logging.error("步骤%d多次重试失败，任务暂停" % idx)
+                print("\n❌ 步骤 %d 多次重试失败，任务暂停。可用 `python main_task.py --reset` 重置后重跑。" % (idx + 1))
+                print("   失败详情已写入 run_log.log")
                 return
         self.save_breakpoint(0, "finish")
         self.oplog.save()
-        logging.info("全部任务执行完成")
+        print("\n🎉 全部 %d 步执行完成。" % len(task_flow))
 
 
 if __name__ == "__main__":
+    import sys
+    # 支持 python main_task.py --reset 清空断点，从头重跑
+    if "--reset" in sys.argv:
+        bp_path = "breakpoint.json"
+        if os.path.exists(bp_path):
+            os.remove(bp_path)
+            print("已重置断点，将从第 0 步重新回放。")
+        else:
+            print("无断点文件，直接从头回放。")
     runner = BreakPointTaskRunner()
     runner.start_run()

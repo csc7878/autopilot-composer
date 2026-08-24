@@ -3,7 +3,7 @@ pyperclip
 websocket-client
 pillow
 opencv-python
-# 桌面录制器（原生 Windows 应用）依赖
+# desktop recorder (native Windows app) deps
 pynput
 pywin32
 psutil

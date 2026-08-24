@@ -60,29 +60,83 @@ RECORDER_JS = r"""
   if (window.__apcRec) return;
   window.__apcRec = true;
 
+  // 生成稳定 CSS 选择器：优先 id > name > 稳定属性 > 文本锚点 > 就近带 id 祖先 + 相对路径
   function bestSelector(el) {
     if (!el || el.nodeType !== 1) return 'body';
-    if (el.id) return '#' + el.id;
     var tag = el.tagName.toLowerCase();
+
+    // 1) id 最稳
+    if (el.id) return '#' + el.id;
+
+    // 2) name 属性（表单元素常见）
     if (el.name) return tag + '[name="' + el.name + '"]';
-    var parts = [];
-    var node = el;
-    // 从元素本身向上爬到 body（不含 html / document）
+
+    // 3) 其它稳定属性
+    var stableAttr = ['placeholder', 'type', 'aria-label', 'data-testid', 'role', 'title', 'alt'];
+    for (var ai = 0; ai < stableAttr.length; ai++) {
+      var av = el.getAttribute(stableAttr[ai]);
+      if (av) {
+        // placeholder/aria-label/title 可能含空格，用属性选择器
+        return tag + '[' + stableAttr[ai] + '="' + String(av).replace(/"/g, '\\"') + '"]';
+      }
+    }
+
+    // 4) 按钮/链接的其它语义属性（标准 CSS，querySelectorAll 可直接用）
+    if (tag === 'button' || tag === 'a') {
+      if (el.getAttribute('type')) {
+        return tag + '[type="' + el.getAttribute('type') + '"]';
+      }
+      var vv = el.getAttribute('value');
+      if (vv) return tag + '[value="' + vv.replace(/"/g, '\\"') + '"]';
+    }
+
+    // 5) 向上找最近的带 id 祖先，从该祖先出发用最短相对路径（避免从 body 一路 nth-child）
+    var anchor = null, node = el.parentNode;
     while (node && node.nodeType === 1 && node.tagName.toLowerCase() !== 'body') {
-      var s = node.tagName.toLowerCase();
-      var parent = node.parentNode;
-      if (parent && parent.nodeType === 1) {
-        var k = 1;
-        for (var i = 0; i < parent.children.length; i++) {
-          if (parent.children[i].tagName.toLowerCase() === s) {
-            if (parent.children[i] === node) break;
-            k++;
+      if (node.id) { anchor = node; break; }
+      node = node.parentNode;
+    }
+    if (anchor) {
+      // 从 anchor 出发，沿 child 链定位 el
+      var chain = [];
+      var cur = el;
+      while (cur && cur !== anchor) {
+        var s2 = cur.tagName.toLowerCase();
+        var p2 = cur.parentNode;
+        if (p2 && p2.nodeType === 1) {
+          var k2 = 1;
+          for (var j = 0; j < p2.children.length; j++) {
+            if (p2.children[j].tagName.toLowerCase() === s2) {
+              if (p2.children[j] === cur) break;
+              k2++;
+            }
+          }
+          s2 += ':nth-child(' + k2 + ')';
+        }
+        chain.unshift(s2);
+        cur = p2;
+      }
+      return '#' + anchor.id + ' ' + chain.join(' > ');
+    }
+
+    // 6) 兜底：从 body 出发的 nth-child 链（最脆弱，仅作保底）
+    var parts = [];
+    var n2 = el;
+    while (n2 && n2.nodeType === 1 && n2.tagName.toLowerCase() !== 'body') {
+      var s3 = n2.tagName.toLowerCase();
+      var pr = n2.parentNode;
+      if (pr && pr.nodeType === 1) {
+        var k3 = 1;
+        for (var m = 0; m < pr.children.length; m++) {
+          if (pr.children[m].tagName.toLowerCase() === s3) {
+            if (pr.children[m] === n2) break;
+            k3++;
           }
         }
-        s += ':nth-child(' + k + ')';
-        parts.unshift(s);
+        s3 += ':nth-child(' + k3 + ')';
+        parts.unshift(s3);
       }
-      node = parent;
+      n2 = pr;
     }
     if (!parts.length) return tag;
     return 'body > ' + parts.join(' > ');
