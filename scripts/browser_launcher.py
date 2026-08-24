@@ -82,6 +82,22 @@ def wait_port(port, timeout=15):
     return False
 
 
+def ensure_url(port, url):
+    """复用模式下：若已有匹配 url 的标签页则激活，否则新建一个。"""
+    with urllib.request.urlopen("http://127.0.0.1:%d/json" % port, timeout=5) as r:
+        targets = json.load(r)
+    norm = (url or "").rstrip("/")
+    for t in targets:
+        if t.get("type") == "page" and (t.get("url") or "").rstrip("/") == norm:
+            return {"action": "activated", "url": t.get("url")}
+    # 没有则新建
+    req = urllib.request.Request(
+        "http://127.0.0.1:%d/json/new?%s" % (port, url), method="PUT")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        d = json.load(r)
+    return {"action": "created", "url": d.get("url")}
+
+
 def launch(port=9222, open_url=None, headless=False, profile_dir=None,
            reuse=True):
     """拉起（或复用）一个开启远程调试的 Chrome 实例。
@@ -91,6 +107,13 @@ def launch(port=9222, open_url=None, headless=False, profile_dir=None,
     # 1) 若端口已可用且 reuse=True，直接复用
     if reuse and port_alive(port):
         exe = find_chrome_executable() or "（已有实例，无法探测路径）"
+        # 复用模式下若指定了 open_url，确保对应标签页存在（命中则激活，否则新建），
+        # 避免「复用旧实例却没打开目标网址、录制器误连无关标签页」的问题。
+        if open_url:
+            try:
+                ensure_url(port, open_url)
+            except Exception:
+                pass
         return {"new": False, "port": port, "executable": exe, "profile": None}
 
     exe = find_chrome_executable()

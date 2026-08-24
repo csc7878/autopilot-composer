@@ -105,42 +105,53 @@ RECORDER_JS = r"""
   emit({ type: 'navigate', initial: true });
 
   // -------- 点击 vs 拖拽 --------
+  // 使用命名函数引用，便于重复注入时由 addEventListener 去重（同引用只绑一次），
+  // 也让 __apcRec 重置后能干净地重新绑定。
   var downInfo = null;
-  document.addEventListener('mousedown', function (e) {
+  function onMouseDown(e) {
     if (e.button !== 0) return;
     downInfo = { x: e.clientX, y: e.clientY, el: e.target, t: Date.now() };
-  });
-  document.addEventListener('mouseup', function (e) {
-    if (e.button !== 0 || !downInfo) return;
+  }
+  function clickPayload(el) {
+    return {
+      type: 'click',
+      selector: bestSelector(el),
+      tag: el.tagName ? el.tagName.toLowerCase() : '',
+      text: (el.innerText || el.value || '').slice(0, 40),
+      el_id: el.id || '',
+      el_name: el.name || '',
+      el_placeholder: el.placeholder || '',
+      el_role: el.getAttribute('role') || '',
+      el_aria_label: el.getAttribute('aria-label') || '',
+      el_text: (el.innerText || '').slice(0, 40)
+    };
+  }
+  function onMouseUp(e) {
+    if (e.button !== 0) return;
+    var el = e.target;
+    if (!downInfo) {
+      // mousedown 未捕获（合成事件 / 跨 context 丢失）时，仍兜底记为一次点击，
+      // 避免「点了搜索按钮却录不到」——这正是程序化驱动与部分站点常见的丢事件根因。
+      emit(clickPayload(el));
+      return;
+    }
     var dx = e.clientX - downInfo.x, dy = e.clientY - downInfo.y;
     var dist = Math.sqrt(dx * dx + dy * dy);
     if (dist > 12) {
-      // 拖拽
       emit({
         type: 'drag',
         from_sel: bestSelector(downInfo.el),
-        to_sel: bestSelector(e.target),
+        to_sel: bestSelector(el),
         from_x: downInfo.x, from_y: downInfo.y,
         to_x: e.clientX, to_y: e.clientY
       });
     } else {
-      // 普通点击（在 mouseup 里发，避免和 click 事件重复）
-      var el = e.target;
-      emit({
-        type: 'click',
-        selector: bestSelector(el),
-        tag: el.tagName ? el.tagName.toLowerCase() : '',
-        text: (el.innerText || el.value || '').slice(0, 40),
-        el_id: el.id || '',
-        el_name: el.name || '',
-        el_placeholder: el.placeholder || '',
-        el_role: el.getAttribute('role') || '',
-        el_aria_label: el.getAttribute('aria-label') || '',
-        el_text: (el.innerText || '').slice(0, 40)
-      });
+      emit(clickPayload(el));
     }
     downInfo = null;
-  });
+  }
+  document.addEventListener('mousedown', onMouseDown);
+  document.addEventListener('mouseup', onMouseUp);
 
   // -------- 悬停（指针在同一元素停留 > 600ms，且非拖拽） --------
   var hoverTimer = null, hoverEl = null;
@@ -206,19 +217,37 @@ class WebRecorder:
         self._pending = {}
         self._pending_ev = threading.Event()
         self.collected = []
-        self._script_id = None
+        # 用锁保护 _id / ws.send，避免后台 _reader_loop 与前台 send_cmd 并发竞争
+        self._lock = threading.Lock()
+        # 支持注入多个文档脚本（含跨 context 重注入），stop 时全部移除
+        self._script_ids = []
+        self.url_filter = None
         self._reader = None
 
     # ---- 连接 ----
-    def connect(self):
+    def connect(self, url_filter=None):
+        """连接调试 Chrome 的一个标签页。
+
+        url_filter：可选，传入子串/正则匹配的 URL，连到命中该模式的页面
+        （多标签页场景下用于精准连到录制/回放目标，避免盲选第一个 page）。
+        若未指定且没有命中项，则回退到第一个可用 page（兼容旧行为）。
+        """
         if self.ws is not None:
             return self.ws
+        if url_filter is not None:
+            self.url_filter = url_filter
         with urllib.request.urlopen(self.http + "/json", timeout=5) as r:
             targets = json.load(r)
         cand = [t for t in targets
                 if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
         if not cand:
             cand = [t for t in targets if t.get("webSocketDebuggerUrl")]
+        if self.url_filter:
+            import re
+            matched = [t for t in cand
+                       if re.search(self.url_filter, t.get("url", "") or "")]
+            if matched:
+                cand = matched
         if not cand:
             raise RuntimeError("未找到可连接的浏览器标签页，请先在调试模式 Chrome 中打开页面")
         ws_url = cand[0]["webSocketDebuggerUrl"]
@@ -240,12 +269,21 @@ class WebRecorder:
             except Exception:
                 continue
             if "id" in data and data["id"] in self._pending:
-                self._pending[data["id"]] = data
+                with self._lock:
+                    self._pending[data["id"]] = data
                 self._pending_ev.set()
             elif data.get("method") == "Runtime.bindingCalled":
                 try:
                     payload = json.loads(data["params"].get("payload", "{}"))
                     self.collected.append(payload)
+                except Exception:
+                    pass
+            elif data.get("method") == "Runtime.executionContextCreated":
+                # 关键修复：新 execution context（Page.navigate 跳转后必然触发）需要
+                # 重建 apcRecord binding + 重新注入录制脚本，否则后续事件全部丢失。
+                ctx = (data.get("params") or {}).get("context") or {}
+                try:
+                    self._activate_context(ctx)
                 except Exception:
                     pass
 
@@ -256,40 +294,87 @@ class WebRecorder:
     # ---- 发命令并等响应 ----
     def send_cmd(self, method, params=None, timeout=10):
         self.connect()
-        mid = self._next_id()
-        self._pending[mid] = None
-        self._pending_ev.clear()
-        self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        with self._lock:
+            mid = self._next_id()
+            self._pending[mid] = None
+            self._pending_ev.clear()
+            self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self._pending.get(mid) is not None:
                 resp = self._pending[mid]
                 if "error" in resp:
-                    raise RuntimeError("CDP error on %sx: %s" % (method, resp["error"]))
+                    raise RuntimeError("CDP error on %s: %s" % (method, resp["error"]))
                 return resp.get("result", {})
             time.sleep(0.05)
         raise TimeoutError("CDP 无响应: %s" % method)
 
+    def _fire_cmd(self, method, params=None):
+        """非阻塞发送（fire-and-forget），用于后台事件处理器，
+        避免阻塞 _reader_loop 的 recv 循环导致死锁。不返回响应。"""
+        try:
+            with self._lock:
+                mid = self._next_id()
+                self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        except Exception:
+            pass
+
+    def _activate_context(self, ctx=None, blocking=False):
+        """在新 / 当前 execution context 重建 apcRecord binding 并注入录制脚本。
+
+        根因：Runtime.addBinding 是 execution-context 级别的。Page.navigate 或 SPA
+        跳转创建新 context 后，旧 context 的 binding 失效，录制脚本的 emit 调用
+        apcRecord 会静默失败（被 RECORDER_JS 的 try/catch 吞掉）——表现为「点了
+        搜索按钮之后的事件全丢」。必须在每个新 context 重新 addBinding + 注入脚本。
+
+        blocking=True 用于初始 context 的确定式激活（需等待响应生效）；
+        非阻塞（默认）用于 _reader_loop 在 executionContextCreated 里调用，避免
+        阻塞后台 recv 循环。
+        """
+        send = self.send_cmd if blocking else self._fire_cmd
+        try:
+            send("Runtime.addBinding", {"name": "apcRecord"})
+        except Exception:
+            pass
+        # 注意：不要重置 window.__apcRec！RECORDER_JS 顶部的
+        #   if (window.__apcRec) return;
+        # 才是「同一 context 仅注入一次监听器」的去重机制。若这里把它置为
+        # undefined，会导致 navigation 后脚本被重复注入、监听器翻倍、事件成对被录到。
+        # addScriptToEvaluateOnNewDocument 已在新文档里注入过一次（设了 __apcRec），
+        # 此处再 evaluate RECORDER_JS 会因 guard 提前 return，不会重复绑定。
+        try:
+            send("Runtime.evaluate", {"expression": RECORDER_JS, "returnByValue": True})
+        except Exception:
+            pass
+
     # ---- 开始 / 停止录制 ----
     def start(self):
         self.send_cmd("Runtime.enable")
-        # 全局绑定：所有 frame（含跨域 iframe）都能调用 apcRecord
-        self.send_cmd("Runtime.addBinding", {"name": "apcRecord"})
         self.send_cmd("Page.enable")
-        # 关键：把录制脚本注入到所有新文档（含跨域 iframe）
-        r = self.send_cmd("Page.addScriptToEvaluateOnNewDocument",
-                          {"source": RECORDER_JS})
-        self._script_id = r.get("identifier")
-        # 立即在当前文档激活（addScriptToEvaluateOnNewDocument 只对未来文档生效）
-        self.send_cmd("Runtime.evaluate", {"expression": RECORDER_JS, "returnByValue": True})
-
-    def stop(self):
+        # 关键修复：不再把「addScriptToEvaluateOnNewDocument 自动注入」当作主通道
+        # （它注入的脚本在新 context 里没有 binding，会静默丢事件）。改为：
+        #  1) 初始 context 立即「阻塞式」激活，确保首屏录制立刻生效；
+        #  2) 之后每个新 context 由 _reader_loop 的 executionContextCreated 事件
+        #     异步重建 binding + 注入脚本（根治导航后事件丢失）。
+        self._activate_context(blocking=True)
+        # 保留 addScriptToEvaluateOnNewDocument 作为兜底（覆盖极少数未触发
+        # executionContextCreated 的边界），并记录全部 id 以便 stop 时彻底移除。
         try:
-            if self._script_id:
-                self.send_cmd("Page.removeScriptToEvaluateOnNewDocument",
-                              {"identifier": self._script_id})
+            r = self.send_cmd("Page.addScriptToEvaluateOnNewDocument",
+                              {"source": RECORDER_JS})
+            self._script_ids.append(r.get("identifier"))
         except Exception:
             pass
+
+    def stop(self):
+        # 移除全部已添加的文档脚本，避免残留导致下次录制双监听 / 事件翻倍
+        for sid in self._script_ids:
+            try:
+                self.send_cmd("Page.removeScriptToEvaluateOnNewDocument",
+                              {"identifier": sid})
+            except Exception:
+                pass
+        self._script_ids = []
         self._running = False
         time.sleep(0.2)
         return list(self.collected)
@@ -599,18 +684,49 @@ def _brief(ev):
 def main():
     ap = argparse.ArgumentParser(description="AutoPilot Composer 网页录制器 v2")
     ap.add_argument("--port", type=int, default=9222, help="Chrome CDP 端口")
+    ap.add_argument("--url-filter", default=None,
+                    help="按 URL 子串/正则筛选要连接的标签页（多标签页防误连目标）")
     ap.add_argument("--out", default="task_flow.json", help="导出的 task_flow.json 路径")
     ap.add_argument("--js", default="recorded_flow.js", help="导出的 Playwright JS 路径")
     ap.add_argument("--elements", default="elements.json", help="导出的元素库路径")
+    ap.add_argument("--duration", type=float, default=None,
+                    help="自动录制时长（秒），到时自动停止；无 tty / 非交互场景使用")
+    ap.add_argument("--stop-file", default=None,
+                    help="监控该文件出现即停止录制（无 tty 场景），如 .apc_stop")
     args = ap.parse_args()
 
     rec = WebRecorder(port=args.port)
-    rec.connect()
+    rec.connect(url_filter=args.url_filter)
     rec.start()
-    try:
-        input("🔴 录制中… 在浏览器里正常操作，回到这里输入任意内容并回车停止：\n> ")
-    except KeyboardInterrupt:
-        pass
+
+    # 停止信号：默认交互回车；无 tty 或指定 --duration / --stop-file 时自动降级，
+    # 避免 input() 在无终端环境下立即 EOFError 退出（修复后台运行录制器秒退）。
+    if (not sys.stdin.isatty()) or args.duration is not None or args.stop_file is not None:
+        hints = []
+        if args.duration is not None:
+            hints.append("%d 秒后自动停止" % args.duration)
+        if args.stop_file is not None:
+            hints.append("检测到 %s 即停止" % args.stop_file)
+        if not hints:
+            hints.append("Ctrl-C 停止")
+        print("🎬 非交互模式：录制中…（%s）" % "；".join(hints))
+        try:
+            if args.duration is not None:
+                time.sleep(args.duration)
+            else:
+                while True:
+                    if args.stop_file and os.path.exists(args.stop_file):
+                        print("🛑 检测到停止文件，结束录制")
+                        break
+                    time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+    else:
+        try:
+            input("🔴 录制中… 在浏览器里正常操作，回到这里输入任意内容并回车停止：\n> ")
+        except KeyboardInterrupt:
+            pass
+
     events = rec.stop()
     rec.close()
 

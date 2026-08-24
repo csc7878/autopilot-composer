@@ -2,7 +2,7 @@
 name: AutoPilot Composer
 displayName: AutoPilot Composer
 slug: autopilot-composer
-version: 3.2.0
+version: 3.3.0
 runtime: python
 tags:
   - automation
@@ -473,7 +473,7 @@ python scripts/chat_mode.py "回放"                          # 回放最近一�
 
 ## 16. 目录结构
 
-autopilot-composer-3.2.0/
+autopilot-composer-3.3.0/
 ├── SKILL.md                 # 本文档
 ├── scripts/
 │   ├── main_task.py         # 任务编排入口（播放）
@@ -501,3 +501,4 @@ autopilot-composer-3.2.0/
 - **本次修订（2026-08-20）**：修复 `main_task.py` 缩进与重试循环；`cdp_engine.py` 改为 page 级 CDP 通道，适配 Chrome 111+ 的 `--remote-allow-origins=*` 要求；`task_flow` 支持外部 `task_flow.json` 配置。
 - **录制能力扩展（2026-08-22）**：网页录制器 v2 新增拖拽/悬停/键盘组合键/文件上传捕获，并支持跨域 iframe；新增桌面录制器与合并录制会话；播放端同步新增 `drag/hover/key_press/upload_file` 等回放方法。
 - **v3.2.0（2026-08-22）**：① 新增 `browser_launcher.py` 自带浏览器启动器；② 新增 `preset_elements.json` 预置元素库；③ 录制器/回放器接入预置库合并；④ 新增 `confirm_box.py` + `chat_mode.py`（对话驱动 + 实时 GUI 弹窗确认录制）；⑤ `cdp_engine.connect` 支持 `url_filter` 精准连接目标标签页；⑥ `recorder.js` 的 bestSelector 修复 html 误判；⑦ 端到端验证通过（对话驱动 → 实时确认 → 落盘 → 回放 PASS）。
+- **v3.3.0（2026-08-24）录制器稳定性关键修复**：① **导航/跳转后 CDP binding 自动重建**——`_reader_loop` 监听 `Runtime.executionContextCreated`，每个新上下文重建 `apcRecord` 绑定并重新注入录制脚本，彻底解决"点击按钮触发跳转后事件全丢"（含搜索/登录/下单等全流程录制的前提）；② **修复事件成对翻倍**——移除 `_activate_context` 中误写的 `window.__apcRec = undefined` 重置行，去重交给 `RECORDER_JS` 顶部 guard + `addScriptToEvaluateOnNewDocument`，避免二次注入导致 change/click/navigate 各记两遍；③ `connect(url_filter=)` 按 URL 精准选页，不再盲连 `cand[0]`（避免误连 about:blank / 残留页）；④ 主循环加 `threading.Lock()` 保护 CDP 命令 id 分配与发送，修复后台 reader 线程与前台 `send_cmd` 并发竞争；⑤ `main()` 新增 `--duration` / `--stop-file` 非交互录制（无 tty 时不再 `input()` 秒退）；⑥ `browser_launcher` 复用模式自动新建/激活 `--open` 目标页（不再忽略 open 参数）；⑦ 配套专家配置 `autopilot-composer-agent.md` 重写为「踩坑与关键约束」。本地 file:// 双页确定性验证 PASS（PageA 输入→整页跳转 PageB→PageB 输入仍被捕获，事件计数 1:1）。
