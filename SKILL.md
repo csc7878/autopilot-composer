@@ -478,8 +478,11 @@ python scripts/chat_mode.py "回放"                          # 回放最近一�
 
 ## 16. 目录结构
 
-autopilot-composer-3.3.2/
+autopilot-composer-3.4.0/
 ├── SKILL.md                 # 本文档
+├── docs/
+│   └── t1-direct-layer.md   # T1 直连层使用指南（API 模板/凭证管理/SQL 安全/Tier 降级）
+├── 小白使用说明.md           # 零基础快速上手手册
 ├── scripts/
 │   ├── main_task.py         # 任务编排入口（播放）
 │   ├── cdp_engine.py        # 浏览器 CDP 引擎（播放端，多策略定位 / URL 过滤连接标签页）
@@ -495,6 +498,10 @@ autopilot-composer-3.3.2/
 │   ├── e2e_preset_test.py   # 端到端验证脚本（自带浏览器+预置库+回放）
 │   ├── e2e_chat_test.py     # 端到端验证脚本（对话驱动+弹窗确认+回放）
 │   ├── config.json / breakpoint.json / task_flow.json
+│   ├── core/                # 核心模块（actions / locator / observer / op_log / components / element_repo
+│   │                        #   + T1 直连层：api_client / api_registry / cli_executor / cli_registry /
+│   │                        #     db_client / db_registry / db_security / credential_manager /
+│   │                        #     network_capture / tier_resolver）
 │   └── requirements.txt
 
 
