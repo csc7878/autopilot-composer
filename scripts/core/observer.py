@@ -75,9 +75,42 @@ class Observer:
         locators = build_web_locators(el) if kind == "web" else build_win_locators(el)
         if not locators:
             return None
-        nm = (el.get("placeholder") or el.get("aria_label") or el.get("name")
-              or el.get("text") or name_hint or el.get("tag") or "element")
+        nm = self._nice_name(el, kind, name_hint)
         return self.repo.register(self.domain, nm, locators, kind=kind)
+
+    def _nice_name(self, el, kind, name_hint=""):
+        """生成结构化、易读的元素名（参考 RPA 编辑器：标签前缀 + 语义）。
+
+        例：<input placeholder="请输入用户名"> → 「输入框_请输入用户名」
+            <button>登录</button>               → 「按钮_登录」
+        这样元素库与回放日志一眼能认，二次编辑也方便。
+        """
+        tag = (el.get("tag") or "").lower()
+        role = el.get("role") or ""
+        semantic = (el.get("placeholder") or el.get("aria_label") or el.get("name")
+                    or el.get("text") or "").strip()
+        if kind == "web":
+            if tag in ("input", "textarea"):
+                prefix = "输入框"
+            elif tag == "select":
+                prefix = "下拉框"
+            elif tag == "button" or role == "button":
+                prefix = "按钮"
+            elif tag == "a":
+                prefix = "链接"
+            elif role:
+                prefix = "控件"
+            else:
+                prefix = "元素"
+        else:
+            prefix = "控件"
+        if semantic:
+            # 去掉可能夹带的换行/多余空白，限长避免过长
+            semantic = " ".join(semantic.split())[:24]
+            return "%s_%s" % (prefix, semantic)
+        if name_hint:
+            return "%s_%s" % (prefix, name_hint)
+        return "%s_%s" % (prefix, (tag or "x"))
 
     def events_to_actions(self, events):
         actions = []

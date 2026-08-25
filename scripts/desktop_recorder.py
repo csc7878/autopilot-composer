@@ -53,6 +53,22 @@ APP_MAP = {
     "ufida.exe": "用友(U8)",
 }
 
+# 不记录为 open_software 的进程（托盘 / 后台 / 系统壳层）。
+# 鼠标只是划过托盘图标、或切到这些后台进程，不应产生「启动应用」步骤，
+# 否则回放时会反复去 startfile 它们（v3.3.3 优化，消除托盘噪声步骤）。
+SKIP_EXES = {
+    "360tray.exe", "360safe.exe", "360sd.exe", "360browser.exe",  # 360 安全卫士相关
+    "explorer.exe",                                                   # 资源管理器壳层
+    "shellexperiencehost.exe", "searchui.exe", "searchapp.exe",
+    "taskhostw.exe", "runtimebroker.exe", "dllhost.exe", "conhost.exe",
+    "rundll32.exe", "tabtip.exe", "ctfmon.exe",                      # 输入法 / 触摸键盘
+    "applicationframehost.exe", "fontdrvhost.exe", "smartscreen.exe",
+    "windows.internal.shellinputprojection.exe",
+}
+
+# 焦点停留低于该秒数后立刻又切走，视为「瞬时抖动」（如划过托盘区），不记录。
+MIN_FOCUS_DWELL = 0.8
+
 
 def _app_name(exe_basename):
     return APP_MAP.get(exe_basename, exe_basename or "未知应用")
@@ -67,6 +83,8 @@ class DesktopRecorder:
         self._running = False
         self._lock = threading.Lock()
         self._last_focus_exe = None
+        self._last_focus_ts = 0
+        self._before_last_focus_exe = None
         self._down = None          # (x, y, button_name) 按下时的状态
         self._last_click = None    # (ts, x, y) 用于双击判定
         self._hover_timer = None
@@ -223,9 +241,21 @@ class DesktopRecorder:
         while self._running:
             info = self._get_foreground()
             exe = info.get("exe")
+            now = time.time()
             if exe and exe != self._last_focus_exe:
+                base = os.path.basename(exe).lower()
+                prev_dwell = now - self._last_focus_ts
+                # 抖动判定：本次焦点 == 上上次的焦点，且中间那次停留极短
+                # （如 主窗口 → 托盘 → 主窗口），视为误触，不记录。
+                is_flicker = (self._before_last_focus_exe == exe
+                              and prev_dwell < MIN_FOCUS_DWELL)
+                # 更新焦点历史（先取旧值再覆盖）
+                self._before_last_focus_exe = self._last_focus_exe
                 self._last_focus_exe = exe
+                self._last_focus_ts = now
                 self._flush_typed()
+                if base in SKIP_EXES or is_flicker:
+                    continue
                 self._emit({"type": "focus", "app": info["app"],
                             "exe": exe, "title": info["title"]})
             time.sleep(0.6)

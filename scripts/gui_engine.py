@@ -10,8 +10,57 @@ pyautogui.FAILSAFE = False
 class GuiAutomation:
     # ---------- 启动软件 ----------
     def open_software(self, path=""):
+        """启动 / 切换到目标软件。
+
+        优化（v3.3.3）：回放时若目标 exe 已有前台窗口，直接把它带到前台，
+        不再新开一个进程 —— 彻底消除「回放越跑窗口越多」的问题。
+        仅当找不到已运行实例时才用 os.startfile 新开。
+        """
+        if path and self._focus_existing_window(path):
+            return
         os.startfile(path)
         time.sleep(2)
+
+    def _focus_existing_window(self, path):
+        """若已存在该 exe 的可见窗口，带到前台并返回 True。找不到/异常则 False。"""
+        try:
+            import win32gui
+            import win32con
+            import win32process
+            import psutil
+        except Exception:
+            return False
+        target = os.path.basename(path).lower()
+        if not target:
+            return False
+        hits = []
+
+        def _enum(hwnd, _):
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                exe = psutil.Process(pid).name().lower()
+            except Exception:
+                return
+            if exe == target:
+                hits.append(hwnd)
+
+        try:
+            win32gui.EnumWindows(_enum, None)
+        except Exception:
+            return False
+        if not hits:
+            return False
+        hwnd = hits[0]
+        try:
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(hwnd)
+            time.sleep(1)
+            return True
+        except Exception:
+            return False
 
     def open_software_by_exe(self, exe_path=""):
         """按可执行文件路径启动（桌面录制器会记录前台窗口的 exe）。"""

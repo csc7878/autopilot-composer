@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+.venv/
+scripts/.venv/
 recordings/
 _e2e_preset/
 _e2e_upgrade/
@@ -9,3 +11,15 @@ bp3/
 bp4/
 browser_profile/
 recordings/
+# ---- 运行产物 / 敏感文件（不入库）----
+scripts/SOP.md*
+scripts/breakpoint.json
+scripts/elements.json
+scripts/operation_log.json
+scripts/recorded_desktop.py
+scripts/recorded_flow.js
+scripts/task_flow.json
+*.bak
+scripts/*_registry.json
+scripts/.credentials.json.enc*
+scripts/db_audit.log

@@ -1,17 +1,22 @@
 # -*- coding: utf-8 -*-
-"""AutoPilot Composer —— 任务编排入口（播放器）【三合一升级版】
+"""AutoPilot Composer —— 任务编排入口（播放器）【四层自动化升级版 v3.4.0】
 
-支持四类原子动作：
-  - browser : 浏览器 CDP 引擎（元素库解析 + 多策略定位回退）
-  - gui     : 桌面 GUI 引擎（坐标 / UIA）
-  - cli     : 代码执行器（Python / Bash，「编码即动作」）
+支持六类原子动作：
+  - browser   : 浏览器 CDP 引擎（元素库解析 + 多策略定位回退）        T2/T4
+  - gui       : 桌面 GUI 引擎（坐标 / UIA）                         T3/T4
+  - cli       : 代码执行器（Python / Bash / COM / PowerShell）      T1
   - component : 复用组件（参数化 JS/Py/子流程）
+  - api       : HTTP API 直调（T1 直连层，录制时 Network 自动捕获）   T1
+  - sql       : SQL 直连数据库（T1 直连层，参数化查询防注入）         T1
 
-播放时：
-  1) 加载 elements.json 到 ElementRepository；
-  2) 每步若含 element_ref，先到元素库解析出最稳定位器再执行，失败自动回退；
-  3) 全程写 operation_log.json（审计 / 流程挖掘）；
-  4) 保留断点续跑 + 自动重试。
+四层自动化模型（Tier）：
+  T1 api/cli/db   - 直调 API/CLI/SQL（最快最稳，不受 UI 改版影响）
+  T2 cdp_element  - 浏览器 CDP 元素定位（稳定，抗改版）
+  T3 uia_element  - 桌面 UIA 元素定位（较稳定）
+  T4 coord        - 屏幕坐标（最脆弱，兜底）
+
+回放策略：每步先检查是否有 T1 路径，有则先试 T1（直调 API/CLI/SQL），
+T1 成功则跳过 GUI 操作；T1 失败自动降级到 T2/T3/T4。
 """
 import json
 import time
@@ -26,6 +31,10 @@ from core.element_repo import ElementRepository
 from core.op_log import OperationLog
 from core import cli_executor
 from core import components as comp_mod
+from core.tier_resolver import TierResolver
+from core.api_registry import ApiRegistry
+from core.cli_registry import CliRegistry
+from core.db_registry import DbRegistry
 
 
 logging.basicConfig(
@@ -59,9 +68,31 @@ class BreakPointTaskRunner:
                                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "components"))
         comp_mod.set_component_dir(comp_dir)
 
+        # T1 直连层：注册表 + Tier 降级解析器
+        self.api_registry = self._load_registry(ApiRegistry, "api_registry_path")
+        self.cli_registry = self._load_registry(CliRegistry, "cli_registry_path")
+        self.db_registry = self._load_registry(DbRegistry, "db_registry_path")
+        self.tier_resolver = TierResolver(
+            api_registry=self.api_registry.templates if self.api_registry else {},
+            cli_registry=self.cli_registry.templates if self.cli_registry else {},
+            db_registry=self.db_registry.connections if self.db_registry else {},
+        )
+
     def load_config(self):
         with open("config.json", "r", encoding="utf-8") as f:
             return json.load(f)
+
+    def _load_registry(self, registry_cls, cfg_key):
+        """加载注册表（API/CLI/DB），从 config.json 的路径读或返回空注册表。"""
+        path = self.cfg.get(cfg_key)
+        if not path:
+            # 默认路径：与 main_task.py 同目录
+            default_name = {"api_registry_path": "api_registry.json",
+                            "cli_registry_path": "cli_registry.json",
+                            "db_registry_path": "db_registry.json"}.get(cfg_key)
+            if default_name:
+                path = os.path.join(os.path.dirname(os.path.abspath(__file__)), default_name)
+        return registry_cls(path) if path else registry_cls()
 
     def load_breakpoint(self):
         path = self.cfg["save_breakpoint_path"]
@@ -103,18 +134,46 @@ class BreakPointTaskRunner:
         action = Action.from_dict(step_info)
         t0 = time.time()
         try:
-            if action.type == "browser":
+            # T1 直连层优先：若步骤本身是 api/cli/sql，或 browser/gui 有 t1_ref
+            if action.type in ("api", "cli", "sql"):
+                self._run_t1(action)
+            elif action.type == "browser":
+                # 先试 T1（若有 t1_ref），成功则跳过 T2
+                if self.tier_resolver.has_t1(step_info):
+                    t1_action = self.tier_resolver.resolve_t1(step_info)
+                    if t1_action:
+                        try:
+                            self._run_t1(t1_action)
+                            dur = int((time.time() - t0) * 1000)
+                            self.oplog.record(self.break_data.get("current_step", 0), action, "success", dur,
+                                              extra={"tier": "T1", "t1_func": t1_action.func})
+                            return True
+                        except Exception as e:
+                            logging.info("T1 降级 -> T2: %s" % e)
+                            # T1 失败，降级到 T2
                 self._run_browser(action)
             elif action.type == "gui":
+                # 同上：先试 T1，失败降级到 T3/T4
+                if self.tier_resolver.has_t1(step_info):
+                    t1_action = self.tier_resolver.resolve_t1(step_info)
+                    if t1_action:
+                        try:
+                            self._run_t1(t1_action)
+                            dur = int((time.time() - t0) * 1000)
+                            self.oplog.record(self.break_data.get("current_step", 0), action, "success", dur,
+                                              extra={"tier": "T1", "t1_func": t1_action.func})
+                            return True
+                        except Exception as e:
+                            logging.info("T1 降级 -> T3/T4: %s" % e)
                 self._run_gui(action)
-            elif action.type == "cli":
-                self._run_cli(action)
             elif action.type == "component":
                 self._run_component(action)
             else:
                 raise RuntimeError("未知动作类型: %s" % action.type)
             dur = int((time.time() - t0) * 1000)
-            self.oplog.record(self.break_data.get("current_step", 0), action, "success", dur)
+            tier = self.tier_resolver.describe_tier(step_info)
+            self.oplog.record(self.break_data.get("current_step", 0), action, "success", dur,
+                              extra={"tier": tier})
             return True
         except Exception as e:
             dur = int((time.time() - t0) * 1000)
@@ -133,6 +192,64 @@ class BreakPointTaskRunner:
                     return sel
                 logging.warning("元素库定位失败，回退内联选择器: %s" % action.element_ref)
         return fallback
+
+    @staticmethod
+    def _clean_keys(keys):
+        """把 Ctrl+字母产生的控制字符（\\x03 等）还原成可读字母，避免日志乱码。"""
+        out = []
+        for k in keys:
+            if isinstance(k, str) and len(k) == 1 and 0 < ord(k) < 0x20:
+                out.append(chr(ord(k) + 0x40))
+            else:
+                out.append(k)
+        return out
+
+    def _step_desc(self, step):
+        """生成一步的人读描述（解析 element_ref 元素名，避免点击打印空白）。"""
+        func = step.get("func", "?")
+        args = step.get("args", step.get("params", []))
+        ref = step.get("element_ref")
+        el_name = ""
+        if ref:
+            el = self.repo.get(ref)
+            if el:
+                el_name = el.get("name", "")
+        app = step.get("app", "")
+        if func == "open_url":
+            return "打开网页 %s" % (args[0] if args else "")
+        if func in ("click_elem", "hover", "upload_file"):
+            return "%s【%s】" % (func, el_name or "元素")
+        if func == "input_text":
+            txt = args[1] if len(args) > 1 else (args[0] if args else "")
+            return "录入「%s」→【%s】" % (txt, el_name or "元素")
+        if func in ("click_at", "double_click_at", "right_click_at", "hover_at"):
+            return "%s(%s, %s)【%s】" % (func, args[0], args[1], app or "桌面")
+        if func == "open_software":
+            return "切换/启动 %s" % (os.path.basename(args[0]) if args else "")
+        if func in ("press_keys", "key_press"):
+            ks = self._clean_keys(args[0]) if args and args[0] else []
+            return "按键 %s" % ("+".join(ks) if ks else "")
+        if func == "drag_move":
+            return "拖拽(%s,%s)→(%s,%s)" % (args[0], args[1], args[2], args[3])
+        if func == "drag":
+            return "拖拽 %s → %s" % (args[0], args[1])
+        # ---- T1 直连层动作 ----
+        if func == "call_api":
+            return "API 调用 %s" % (args[0] if args else "")
+        if func == "run_com":
+            return "COM %s.%s" % (args[0] if len(args) > 0 else "", args[1] if len(args) > 1 else "")
+        if func == "run_ps":
+            return "PowerShell %s" % (str(args[0])[:40] if args else "")
+        if func == "run_template":
+            return "CLI 模板 %s" % (args[0] if args else "")
+        if func in ("query", "execute", "transaction"):
+            label = {"query": "SQL 查询", "execute": "SQL 执行",
+                     "transaction": "SQL 事务"}[func]
+            sql = args[0] if args else ""
+            if isinstance(sql, str):
+                sql = sql.strip().split("\n")[0][:40]
+            return "%s: %s" % (label, sql)
+        return func
 
     def _run_browser(self, action):
         func = action.func
@@ -163,10 +280,46 @@ class BreakPointTaskRunner:
         getattr(self.gui, action.func)(*action.params)
 
     def _run_cli(self, action):
-        res = cli_executor.execute(action)
+        res = cli_executor.execute(action, registry=self.cli_registry)
         if res["rc"] != 0:
-            raise RuntimeError("CLI 执行失败(rc=%s): %s" % (res["rc"], res["stderr"][:200]))
-        logging.info("CLI 输出: %s" % res["stdout"][:200])
+            raise RuntimeError("CLI 执行失败(rc=%s): %s" % (res["rc"], res.get("stderr", "")[:200]))
+        logging.info("CLI 输出: %s" % res.get("stdout", "")[:200])
+
+    def _run_t1(self, action):
+        """T1 直连层统一执行入口（api/cli/sql）。"""
+        if action.type == "api":
+            self._run_api(action)
+        elif action.type == "cli":
+            self._run_cli(action)
+        elif action.type == "sql":
+            self._run_sql(action)
+        else:
+            raise RuntimeError("T1 不支持的动作类型: %s" % action.type)
+
+    def _run_api(self, action):
+        """执行 API 调用（T1 直连层）。"""
+        from core.api_client import ApiClient
+        client = ApiClient(registry=self.api_registry.templates if self.api_registry else {})
+        api_name = action.params[0] if action.params else ""
+        overrides = action.params[1] if len(action.params) > 1 else {}
+        cred_ref = getattr(action, "credential_ref", None) or action.params[2] if len(action.params) > 2 else None
+        res = client.call(api_name, credential_ref=cred_ref, overrides=overrides)
+        if res.get("rc") != 0:
+            raise RuntimeError("API 调用失败: %s" % res.get("error", "")[:200])
+        status = res.get("status", 0)
+        if status and not (200 <= status < 300):
+            raise RuntimeError("API 返回非 2xx: %s" % status)
+        logging.info("API %s -> %s (%dms)" % (api_name, status, res.get("elapsed_ms", 0)))
+
+    def _run_sql(self, action):
+        """执行 SQL 操作（T1 直连层）。"""
+        from core.db_client import execute as db_execute
+        cred_ref = getattr(action, "credential_ref", None)
+        res = db_execute(action, registry=self.db_registry, credential_ref=cred_ref)
+        if res.get("rc") != 0:
+            raise RuntimeError("SQL 执行失败: %s" % res.get("error", "")[:200])
+        logging.info("SQL %s -> %s 行 (%dms)" % (action.func, res.get("row_count",
+                     res.get("rows_affected", 0)), res.get("elapsed_ms", 0)))
 
     def _run_component(self, action):
         name = action.params[0]
@@ -200,8 +353,13 @@ class BreakPointTaskRunner:
 
         for idx in range(start_idx, len(task_flow)):
             step = task_flow[idx]
-            desc = step.get("func", step.get("type", "?"))
-            args_preview = ", ".join(str(a) for a in step.get("args", []))[:40]
+            # 支持单步禁用（RPA 编辑器风格）：enabled 置 false 即跳过
+            if step.get("enabled") is False:
+                print("  ⏭️ 步骤 %d/%d  已禁用，跳过" % (idx + 1, len(task_flow)))
+                self.save_breakpoint(idx + 1, "running")
+                continue
+            desc = self._step_desc(step)
+            tier = self.tier_resolver.describe_tier(step)
             retry = 0
             success = False
             err_info = ""
@@ -210,7 +368,7 @@ class BreakPointTaskRunner:
                     self.run_single_step(task_flow[idx])
                     success = True
                     self.save_breakpoint(idx + 1, "running")
-                    print("  ✅ 步骤 %d/%d  [%s %s]" % (idx + 1, len(task_flow), desc, args_preview))
+                    print("  \u2705 \u6b65\u9aa4 %d/%d  [%s] {%s}" % (idx + 1, len(task_flow), desc, tier))
                     time.sleep(self.cfg["delay_base"])
                     logging.info("步骤%d执行成功" % idx)
                     break
@@ -218,8 +376,8 @@ class BreakPointTaskRunner:
                     retry += 1
                     err_info = "步骤%d异常：%s" % (idx, str(e))
                     logging.error(err_info)
-                    print("  ⚠️ 步骤 %d/%d  [%s] 重试 %d/%d：%s"
-                          % (idx + 1, len(task_flow), desc, retry, self.max_retry, str(e)[:60]))
+                    print("  \u26a0\ufe0f \u6b65\u9aa4 %d/%d  [%s] {%s} \u91cd\u8bd5 %d/%d\uff1a%s"
+                          % (idx + 1, len(task_flow), desc, tier, retry, self.max_retry, str(e)[:60]))
                     time.sleep(2)
             if not success:
                 self.save_breakpoint(idx, "error", err_info)

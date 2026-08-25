@@ -43,10 +43,12 @@ try:
 except ImportError:
     raise SystemExit("缺少依赖 websocket-client，请先 pip install websocket-client")
 
-# 接入 core 的元素库/Observer（不在则回退到纯 selector 模式）
+# 接入 core 的元素库/Observer + Network 捕获（不在则回退到纯 selector 模式）
 try:
     from core.observer import Observer
     from core.element_repo import ElementRepository
+    from core.network_capture import NetworkCapture
+    from core.api_registry import ApiRegistry
     _HAS_CORE = True
 except ImportError:
     _HAS_CORE = False
@@ -277,6 +279,8 @@ class WebRecorder:
         self._script_ids = []
         self.url_filter = None
         self._reader = None
+        # T1 直连层：Network 域捕获（录制时自动把 UI 点击背后的 API 请求录成 T1 动作）
+        self.network_capture = NetworkCapture() if _HAS_CORE else None
 
     # ---- 连接 ----
     def connect(self, url_filter=None):
@@ -338,6 +342,13 @@ class WebRecorder:
                 ctx = (data.get("params") or {}).get("context") or {}
                 try:
                     self._activate_context(ctx)
+                except Exception:
+                    pass
+            # T1 直连层：Network 域事件转发给 NetworkCapture
+            elif self.network_capture and data.get("method", "").startswith("Network."):
+                try:
+                    self.network_capture.handle_event(
+                        data["method"], data.get("params", {}))
                 except Exception:
                     pass
 
@@ -419,6 +430,9 @@ class WebRecorder:
             self._script_ids.append(r.get("identifier"))
         except Exception:
             pass
+        # T1 直连层：启用 Network 域监听，自动捕获 UI 点击背后的 API 请求
+        if self.network_capture:
+            self.network_capture.attach(self.send_cmd)
 
     def stop(self):
         # 移除全部已添加的文档脚本，避免残留导致下次录制双监听 / 事件翻倍
@@ -429,6 +443,9 @@ class WebRecorder:
             except Exception:
                 pass
         self._script_ids = []
+        # T1 直连层：停止 Network 域监听
+        if self.network_capture:
+            self.network_capture.detach()
         self._running = False
         time.sleep(0.2)
         return list(self.collected)
@@ -733,6 +750,63 @@ def _brief(ev):
 
 
 # ---------------------------------------------------------------------------
+# T1 直连层：给 browser 步骤关联 API 模板引用
+# ---------------------------------------------------------------------------
+def _attach_t1_refs(steps, events, api_events, api_registry):
+    """给 browser 类型步骤关联 t1_ref（指向录制的 API 模板）。
+
+    匹配策略：UI 事件与 API 请求时间戳相近（< 3 秒）且 URL 不含静态资源，
+    则把 API 模板名作为 t1_ref 附到 UI 步骤上。回放时 tier_resolver 先试 T1。
+    """
+    if not api_events or not api_registry.templates:
+        return
+
+    # 按时间戳配对：UI 事件 ts -> 最近的 API 请求 ts
+    for step in steps:
+        if step.get("type") != "browser":
+            continue
+        if step.get("func") not in ("click_elem", "input_text", "upload_file"):
+            continue
+        # 找到对应 UI 事件的时间戳
+        step_ts = _find_step_ts(step, events)
+        if not step_ts:
+            continue
+        # 在 API 请求中找时间最近的（3 秒内）
+        best_api = None
+        best_diff = 3000  # 3 秒
+        for api_req in api_events:
+            api_ts = api_req.get("ts", 0)
+            diff = abs(api_ts - step_ts)
+            if diff < best_diff:
+                best_diff = diff
+                best_api = api_req
+        if best_api:
+            # 从 API 请求找到模板名
+            api_name = api_registry.infer_name_from_url(
+                best_api.get("method", "GET"), best_api.get("url", ""))
+            if api_name in api_registry.templates:
+                step["t1_ref"] = {
+                    "type": "api",
+                    "name": api_name,
+                    "overrides": {},
+                }
+
+
+def _find_step_ts(step, events):
+    """从步骤反查原始事件时间戳（粗略匹配）。"""
+    func = step.get("func", "")
+    selector = step.get("args", [""])[0] if step.get("args") else ""
+    for ev in events:
+        if func == "click_elem" and ev.get("type") == "click":
+            if ev.get("selector") == selector:
+                return ev.get("ts", 0)
+        if func == "input_text" and ev.get("type") == "change":
+            if ev.get("selector") == selector:
+                return ev.get("ts", 0)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def main():
@@ -791,14 +865,28 @@ def main():
     # 元素库 + 原子动作建模（若 core 不可用则降级为纯 selector）
     observer = None
     preset_repo = None
+    api_registry = None
     if _HAS_CORE:
         preset_repo = ElementRepository.load_preset(
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "preset_elements.json")
         )
         user_repo = ElementRepository(args.elements)
         observer = Observer(user_repo, domain="web", preset_repo=preset_repo)
+        # T1 直连层：把 Network 捕获的 API 请求转为模板
+        if rec.network_capture and rec.network_capture.requests:
+            api_registry = ApiRegistry()
+            rec.network_capture.to_api_templates(api_registry)
+            api_path = os.path.join(os.path.dirname(os.path.abspath(args.out)),
+                                    "api_registry.json")
+            api_registry.save(api_path)
+            print("   - api_registry.json  (%d 个 API 模板，T1 直连层)" % len(api_registry.templates))
 
     tf = events_to_taskflow(events, observer)
+
+    # T1 直连层：给 browser 步骤关联 t1_ref（若有 API 模板）
+    if api_registry and api_registry.templates:
+        _attach_t1_refs(tf, events, rec.network_capture.get_api_events(), api_registry)
+
     js_lines = events_to_playwright(events)
 
     with open(args.out, "w", encoding="utf-8") as f:

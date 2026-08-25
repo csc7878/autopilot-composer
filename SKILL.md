@@ -2,7 +2,7 @@
 name: AutoPilot Composer
 displayName: AutoPilot Composer
 slug: autopilot-composer
-version: 3.3.2
+version: 3.4.0
 runtime: python
 tags:
   - automation
@@ -16,7 +16,12 @@ tags:
   - components
   - browser-launcher
   - preset-elements
-description: 桌面 GUI（pyautogui）+ 浏览器 CDP 双引擎 RPA，支持「录制→元素库→回放」原子动作建模、复用组件库、操作日志审计与流程挖掘、断点续跑与自动重试，对标影刀/UiPath 的企业级自动化能力。
+  - tier-resolver
+  - api-direct
+  - sql-direct
+  - credential-manager
+  - network-capture
+description: 桌面 GUI（pyautogui）+ 浏览器 CDP 双引擎 RPA，支持「录制→元素库→回放」原子动作建模、复用组件库、操作日志审计与流程挖掘、断点续跑与自动重试。v3.4.0 新增 T1 直连层（CLI/API/SQL），录制时自动捕获 UI 背后的 API 请求，回放时优先直调 API/CLI/SQL，失败自动降级到 GUI，对标影刀/UiPath 的企业级自动化能力。
 entry: ./scripts/main_task.py
 trigger:
   - 启动长任务自动化
@@ -503,4 +508,6 @@ autopilot-composer-3.3.2/
 - **v3.2.0（2026-08-22）**：① 新增 `browser_launcher.py` 自带浏览器启动器；② 新增 `preset_elements.json` 预置元素库；③ 录制器/回放器接入预置库合并；④ 新增 `confirm_box.py` + `chat_mode.py`（对话驱动 + 实时 GUI 弹窗确认录制）；⑤ `cdp_engine.connect` 支持 `url_filter` 精准连接目标标签页；⑥ `recorder.js` 的 bestSelector 修复 html 误判；⑦ 端到端验证通过（对话驱动 → 实时确认 → 落盘 → 回放 PASS）。
 - **v3.3.0（2026-08-24）录制器稳定性关键修复**：① **导航/跳转后 CDP binding 自动重建**——`_reader_loop` 监听 `Runtime.executionContextCreated`，每个新上下文重建 `apcRecord` 绑定并重新注入录制脚本，彻底解决"点击按钮触发跳转后事件全丢"（含搜索/登录/下单等全流程录制的前提）；② **修复事件成对翻倍**——移除 `_activate_context` 中误写的 `window.__apcRec = undefined` 重置行，去重交给 `RECORDER_JS` 顶部 guard + `addScriptToEvaluateOnNewDocument`，避免二次注入导致 change/click/navigate 各记两遍；③ `connect(url_filter=)` 按 URL 精准选页，不再盲连 `cand[0]`（避免误连 about:blank / 残留页）；④ 主循环加 `threading.Lock()` 保护 CDP 命令 id 分配与发送，修复后台 reader 线程与前台 `send_cmd` 并发竞争；⑤ `main()` 新增 `--duration` / `--stop-file` 非交互录制（无 tty 时不再 `input()` 秒退）；⑥ `browser_launcher` 复用模式自动新建/激活 `--open` 目标页（不再忽略 open 参数）；⑦ 配套专家配置 `autopilot-composer-agent.md` 重写为「踩坑与关键约束」。本地 file:// 双页确定性验证 PASS（PageA 输入→整页跳转 PageB→PageB 输入仍被捕获，事件计数 1:1）。
 - **v3.3.1（2026-08-24）文档升级（无功能代码变更）**：`小白使用说明.md` 整体重写至与 v3.3.0 能力对齐——补全 **录制模式（recorder.py：交互录制 / `--url-filter` 选页 / `--duration`/`--stop-file` 后台录制）**、**对话式录制（chat_mode.py + confirm_box.py 实时弹窗确认）**、**桌面录制（desktop_recorder.py）与网页+桌面合并录制（record_session.py）**、**`browser_launcher.py` 一键拉起调试 Chrome**、以及 **FAQ（导航丢事件已修 / 多标签页用 `--url-filter` / 后台无人值守录制）**。技能版本号同步 bump，使线上文档与引擎版本一致。
+- **v3.3.3（2026-08-25）回放体验 + 产物可视化重大优化（ABCD 全执行）**：① **A 跨应用切换不再新开窗口**——`gui_engine.open_software` 回放时先按 exe 查找已运行窗口并 `SetForegroundWindow` 前置，找不到才 `os.startfile` 新开，彻底消除"回放越跑窗口越多"；② **B 合并录制去重**——`record_session.py` 合并网页+桌面时，自动丢弃落在 Chrome 窗口矩形内的桌面坐标点击/悬停（网页侧已捕获同一动作），回放不再按屏幕坐标盲点；③ **C 桌面录制过滤噪声**——`desktop_recorder` 新增 `SKIP_EXES`（360tray/explorer/输入法等托盘后台进程不记成 `open_software`）+ 焦点抖动去抖（瞬时切回原窗口不记录）；④ **D 元素自动结构化命名**——`Observer._reg` 按标签前缀生成可读名（如 `输入框_请输入用户名`、`按钮_登录`），元素库与回放日志一眼可认；⑤ **回放打印补全**——`main_task` 每步打印元素名（点击不再空白）、`Ctrl+C/V` 等控制字符还原为可读字母、并支持单步 `enabled:false` 禁用；⑥ **产物可视化**——`task_flow.json` 每步新增 `comment`/`app`/`enabled` 字段（像 RPA 编辑器一样易读易改），`SOP.md` 新增 **Mermaid 流程架构图 + ASCII 双版本**、按应用分组、元素库速查表、二次编辑指南；⑦ 依赖 `requirements.txt` 的 `psutil` 锁版 `==6.1.1`（6.x 仍带 win32 预编译 wheel，免编译，适配 32 位 Python）。本地离线验证全过。
 - **v3.3.2（2026-08-24）回放稳定性 + 易用性修复**：① **bestSelector 生成稳定选择器**——`recorder.js` 优先用 `placeholder/type/aria-label/data-testid/role/title/alt` 等语义属性生成 `input[placeholder="请输入用户名"]` 这类稳健定位器，仅在无任何语义属性时才退化为就近带 id 祖先相对路径 / body nth-child 链，彻底解决 wn.gjhl 等页面因 nth-child 脆弱链导致回放卡在步骤 9 报 NOT_FOUND；② **main_task 回放进度可视化**——`start_run()` 每步打印 `✅ 步骤 n/总数 [动作 参数]`，失败时打印重试与暂停提示，结束打印 `🎉 全部 n 步执行完成`，不再静默只写 run_log.log；支持 `python main_task.py --reset` 清空断点从头重跑；③ **requirements.txt 转纯 ASCII（UTF-8 无 BOM）**——去掉中文注释，修复 Windows GBK 下 pip 读 req 文件 `UnicodeDecodeError (0xa8)` 导致安装失败。端到端验证：修复后录制登录（placeholder 定位）生成 3 步 task_flow，回放 3 步全 ✅ 且进度清晰。
+- **v3.4.0（2026-08-25）T1 直连层（CLI/API/SQL）—— 从 GUI 定位到直连架构**：基于 ICML 2024 CodeAct、Selenium 定位器脆性（73.6% 失败源于脆弱定位器）等论文佐证，设计四层自动化模型（T1 api/cli/db > T2 cdp_element > T3 uia_element > T4 coord）。① **凭证管理器** `credential_manager.py`——凭证不进 task_flow.json，用 credential_ref 引用，支持 keyring（Windows Credential Manager）/ 环境变量 / 加密 JSON 三种后端；② **API 子模块** `api_client.py` + `api_registry.py`——HTTP 全方法 + Bearer/Basic/API Key/Cookie 鉴权 + 超时重试 + 响应断言（status/body_contains/json_path）；③ **SQL 子模块** `db_client.py` + `db_registry.py` + `db_security.py`——参数化查询防注入 + 事务 + read_only 保护 + 审计日志 + 敏感字段脱敏，支持 pyodbc/pymysql/sqlite3；④ **CLI 扩展** `cli_executor.py` 新增 COM 自动化（WPS/金蝶/Excel）、PowerShell、模板执行（白名单模式）；`cli_registry.py` 注册命令模板；⑤ **CDP Network 捕获** `network_capture.py`——录制时监听 Network 域，自动捕获 UI 点击背后的 XHR/fetch 请求，生成 API 模板并关联 `t1_ref` 到 browser 步骤；⑥ **Tier 降级解析器** `tier_resolver.py`——回放时每步先试 T1（直调 API/CLI/SQL），成功跳过 GUI，失败自动降级到 T2/T3/T4；⑦ **main_task 集成**——回放日志标注 Tier `{T1(call_api)}` / `{T2(cdp)}` / `{T4(coord)}`，OperationLog 记录 tier 字段；⑧ **config.json** 新增 `api_registry_path` / `cli_registry_path` / `db_registry_path` 注册表路径；⑨ **requirements.txt** 新增 requests/keyring/cryptography/pymysql。学术依据：CodeAct（ICML 2024, arXiv:2402.01030）证明可执行代码动作空间比离散 UI 动作成功率 +20%、动作数 -30%；GUI 定位器脆性（Hammoudi 2016）73.6% 测试失败源于脆弱定位器。

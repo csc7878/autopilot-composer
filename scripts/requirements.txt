@@ -6,4 +6,10 @@ opencv-python
 # desktop recorder (native Windows app) deps
 pynput
 pywin32
-psutil
+psutil==6.1.1  # pin 6.1.1: psutil>=7 dropped win32 wheel, forces source build (needs MSVC 14.0)
+# T1 direct-connect layer deps (v3.4.0+)
+requests         # API client (HTTP)
+keyring          # credential manager (Windows Credential Manager)
+cryptography    # credential file backend (AES-Fernet)
+pymysql          # SQL: MySQL driver
+# pyodbc         # SQL: SQL Server / ODBC driver (uncomment if needed; requires ODBC Driver 17+)
