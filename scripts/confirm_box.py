@@ -130,6 +130,141 @@ def confirm_action(action, timeout=8):
     return ConfirmBox(timeout=timeout).ask(action)
 
 
+# ==================================================================
+# v3.5.0：通用多选项确认框（供「置信度驱动的自适应介入」使用）
+# ==================================================================
+
+def ask_choice(message, title="需要你确认", options=None, timeout=60,
+               default_index=0, detail_lines=None, headline=None):
+    """弹出多选项确认框，返回所选选项的 value。
+
+    与 ConfirmBox（录制时「记录/跳过」）的区别：本函数面向**回放时的自适应
+    介入**——当某一步置信度偏低时，把「为什么低」摊开给用户看，由他决定
+    继续 / 跳过 / 暂停，而不是盲目重试到崩。
+
+    参数
+    ----
+    message      : 主提示（一般是这一步将要做什么）
+    options      : [{"label": "继续执行", "value": "continue"}, ...]
+    detail_lines : 归因说明，逐行展示（如置信度的加减项）
+    headline     : 顶部大字（如「置信 2.10/5 偏低」）
+    timeout      : 秒；超时自动选 default_index 对应的项
+    default_index: 默认项下标（注意：把「最保守」的选项配合适的默认值）
+    """
+    options = options or [{"label": "继续", "value": "continue"}]
+    detail_lines = detail_lines or []
+    try:
+        return _run_choice_tk(message, title, options, timeout,
+                              default_index, detail_lines, headline)
+    except Exception as e:
+        # 无 GUI 环境降级为命令行确认，保证不因为弹不出窗而卡死
+        print("\n" + "=" * 60)
+        print("⚠️ 无法弹出 GUI 确认框（%s），改为命令行确认：" % e)
+        if headline:
+            print("   %s" % headline)
+        print("   %s" % message)
+        for ln in detail_lines:
+            print("   %s" % ln)
+        for i, op in enumerate(options):
+            mark = "*" if i == default_index else " "
+            print("   %s[%d] %s" % (mark, i + 1, op.get("label")))
+        try:
+            raw = input("   请选择序号（回车=默认，%d 秒后自动继续）: " % timeout).strip()
+        except Exception:
+            raw = ""
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return options[int(raw) - 1].get("value")
+        return options[default_index].get("value")
+
+
+def _run_choice_tk(message, title, options, timeout, default_index,
+                   detail_lines, headline):
+    import tkinter as tk
+    from tkinter import ttk
+
+    root = tk.Tk()
+    root.title(title)
+    root.attributes("-topmost", True)
+    try:
+        root.wm_attributes("-toolwindow", True)
+    except Exception:
+        pass
+
+    frame = ttk.Frame(root, padding=14)
+    frame.pack(fill="both", expand=True)
+
+    ttk.Label(frame, text="AutoPilot 回放确认",
+              font=("Microsoft YaHei", 11, "bold")).pack(anchor="w")
+    if headline:
+        ttk.Label(frame, text=headline, font=("Microsoft YaHei", 13, "bold"),
+                  foreground="#c0392b").pack(anchor="w", pady=(6, 2))
+    ttk.Label(frame, text=message, font=("Microsoft YaHei", 10),
+              wraplength=430, justify="left").pack(anchor="w", pady=(4, 6))
+
+    if detail_lines:
+        box = tk.Text(frame, height=min(10, max(3, len(detail_lines) + 1)),
+                      width=54, wrap="word", font=("Consolas", 9),
+                      relief="solid", borderwidth=1, background="#f7f7f7")
+        box.insert("1.0", "\n".join(detail_lines))
+        box.configure(state="disabled")
+        box.pack(fill="both", expand=True, pady=(0, 8))
+
+    btn_frame = ttk.Frame(frame)
+    btn_frame.pack(anchor="e", pady=(2, 4))
+
+    chosen = {"v": options[default_index].get("value")}
+    closed = {"done": False}
+
+    def pick(op):
+        chosen["v"] = op.get("value")
+        closed["done"] = True
+        root.destroy()
+
+    for op in options:
+        ttk.Button(btn_frame, text=op.get("label", "?"), width=12,
+                   command=lambda o=op: pick(o)).pack(side="left", padx=4)
+
+    lbl = ttk.Label(frame, text="%d 秒后自动选择：%s"
+                    % (timeout, options[default_index].get("label", "")),
+                    foreground="#888")
+    lbl.pack(anchor="e")
+
+    remain = {"t": int(timeout)}
+
+    def tick():
+        remain["t"] -= 1
+        if not root.winfo_exists():
+            return
+        if remain["t"] <= 0:
+            pick(options[default_index])
+        else:
+            lbl.config(text="%d 秒后自动选择：%s"
+                       % (remain["t"], options[default_index].get("label", "")))
+            root.after(1000, tick)
+
+    root.after(1000, tick)
+
+    root.update_idletasks()
+    w, h = root.winfo_width(), root.winfo_height()
+    x = (root.winfo_screenwidth() - w) // 2
+    y = (root.winfo_screenheight() - h) // 2
+    root.geometry("+%d+%d" % (max(0, x), max(0, y)))
+    root.resizable(False, False)
+    root.mainloop()
+    return chosen["v"]
+
+
 if __name__ == "__main__":
     a = {"type": "change", "selector": "#kw", "value": "autopilot"}
     print("用户选择记录?", confirm_action(a))
+    print("多选项测试 ->", ask_choice(
+        "步骤 12：点击【登录】按钮",
+        headline="置信 1.90/5 偏低",
+        detail_lines=["[基准 1.8] T4 路径（屏幕坐标，最脆弱）",
+                      "[-1.20] 有 3 个元素都匹配，存在点错的风险",
+                      "[-0.40] 最近有 1 次未命中记录"],
+        options=[{"label": "继续执行", "value": "continue"},
+                 {"label": "跳过这步", "value": "skip"},
+                 {"label": "暂停任务", "value": "pause"}],
+        timeout=15, default_index=2))
+

@@ -2,7 +2,7 @@
 name: AutoPilot Composer
 displayName: AutoPilot Composer
 slug: autopilot-composer
-version: 3.4.1
+version: 3.5.0
 runtime: python
 tags:
   - automation
@@ -24,7 +24,12 @@ tags:
   - result-verify
   - element-health
   - self-healing
-description: 桌面 GUI（pyautogui）+ 浏览器 CDP 双引擎 RPA，支持「录制→元素库→回放」原子动作建模、复用组件库、操作日志审计与流程挖掘、断点续跑与自动重试。v3.4.0 新增 T1 直连层（CLI/API/SQL），录制时自动捕获 UI 背后的 API 请求，回放时优先直调 API/CLI/SQL，失败自动降级到 GUI。v3.4.1 新增步骤级结果校验（verify，不再「点完就算成功」）与元素库健康度自愈（定位器连续失败自动遗忘、元素复活）。对标影刀/UiPath 的企业级自动化能力。
+  - confidence-driven
+  - adaptive-intervention
+  - env-guard
+  - step-stats
+  - checkpoint-rollback
+description: 桌面 GUI（pyautogui）+ 浏览器 CDP 双引擎 RPA，支持「录制→元素库→回放」原子动作建模、复用组件库、操作日志审计与流程挖掘、断点续跑与自动重试。v3.4.0 新增 T1 直连层（CLI/API/SQL），录制时自动捕获 UI 背后的 API 请求，回放时优先直调 API/CLI/SQL，失败自动降级到 GUI。v3.4.1 新增步骤级结果校验（verify，不再「点完就算成功」）与元素库健康度自愈。v3.5.0 新增置信度驱动的自适应执行：给每步打 0~5 分把握分（零模型，纯确定性信号合成），低置信时主动请求人工确认而不是盲目执行；识别登录页过期/错误页/意外弹窗等环境陷阱并尝试自愈；重试不再原样重跑而是自适应轮换策略。对标影刀/UiPath 的企业级自动化能力。
 entry: ./scripts/main_task.py
 trigger:
   - 启动长任务自动化
@@ -393,6 +398,57 @@ python main_task.py --health-reset    # 人工复核后：恢复被自动遗忘�
 
 统计结果随 `elements.json` 落盘（每 20 步落一次 + 结束/失败时落一次），不含预置元素库条目。
 
+## 8.6 置信度驱动的自适应执行（v3.5.0 新增）
+
+**要解决的问题**：传统 RPA 的失败模式不是「跑不动」，而是**过度执行**——某一步其实没把握
+（元素改了、页面没加载完、会话过期被踢回登录页），它照样全自动往下跑，不报错、不中断，
+直到最后一步才对不上账。OS-Kairos（ACL 2025 Findings, arXiv:2503.16465）在复杂场景实测：
+全自动 14.29% vs 每步都问人 62% vs **自适应介入 88.20%** ——
+**「何时介入」比「要不要介入」更关键**。
+
+本版把该机制移植到确定性 RPA，**不训练任何模型**（本机 2 核 Pentium / 8GB / 核显跑不了 VLM），
+改用回放过程中已经存在的客观信号合成 0~5 分：
+
+| 信号 | 影响 |
+|---|---|
+| Tier 层级 | 基准：T1=4.7 / T2=4.2 / T3=3.4 / T4=1.8 |
+| 定位唯一性 | 唯一命中 +0.5；多匹配 −1.2；未命中 −1.8 |
+| 定位策略 | id/name +0.35 → css 0 → css_chain −0.5 → 坐标 −0.8 |
+| 元素健康度 | 稳定命中 +0.4；连续未命中 ≥3 −0.9；已遗忘 −1.5 |
+| 步骤历史成功率 | `(成功率 − 0.9) × 1.5` |
+| 是否配 verify | +0.3（能发现失败，不会假成功） |
+| 环境状态 | **封顶**：cdp_down 0.5 / login 1.2 / error_page 1.0 / dialog 1.6 |
+
+三档动作：≥ 3.5 自动执行；1.2 ~ 2.5 请求确认；< 1.2 直接中止（连「继续执行」选项都不给）。
+
+**三种模式**（`config.json → confidence.mode`）：
+
+| 模式 | 行为 | 适用 |
+|---|---|---|
+| `off` | 关闭，行为与 v3.4.x 完全一致 | 排障 |
+| `shadow` | **默认**。只评分、只记录、只告警，**从不打断** | 上线初期零风险观察 |
+| `adaptive` | 低置信弹窗确认（继续/跳过/暂停），极低置信暂停 | 正式流程 |
+
+**配套四项机制**（由同一套信号驱动）：
+
+1. **环境守卫** `core/env_guard.py`：识别 `cdp_down` / `login` / `error_page` / `dialog`。
+   判断登录页时要求深检确认存在密码框（防止把正常的 `/login` 展示页误判）。
+   **会话过期时明确返回「需人工登录」，不假装能自愈**——重登涉及凭证，该喊人就喊人。
+2. **策略轮换重试**：重试不再原样重跑同一动作，而是换做法，顺序**自适应**——
+   环境异常时先修环境（在登录页上换定位器毫无意义），环境正常时才先换定位策略。
+3. **检查点与回滚** `core/checkpoint.py`：每步成功后记录 URL/标题，失败诊断时回退到
+   上一个已知良好状态。与 `breakpoint.json` 互补：后者管「跑到第几步」，前者管「页面被带偏了」。
+4. **步骤战绩** `core/step_stats.py`：按步骤指纹（忽略 id/ts 等易变字段）累计成功率，
+   给置信度提供模型没有的先验；样本 < 2 不给判断，避免「一次失败被永久打标签」。
+
+```bash
+python main_task.py            # 正常回放（结尾输出置信度汇总）
+python main_task.py --health   # 元素库体检 + 步骤战绩（哪几步最容易失败）
+```
+
+完整教程（信号详解、模式选择建议、配置参考、现场输出解读、学术溯源对照表）见
+`docs/confidence-and-intervention.md`。
+
 ## 9. 配置项 `config.json`
 
 ```json
@@ -409,7 +465,21 @@ python main_task.py --health-reset    # 人工复核后：恢复被自动遗忘�
   "gui_safe_mode": true,
   "task_flow_path": "./task_flow.json",
   "verify_timeout": 5.0,
-  "verify_interval": 0.3
+  "verify_interval": 0.3,
+  "step_stats_path": "./step_stats.json",
+  "checkpoint_path": "./checkpoints.json",
+  "stats_min_samples": 2,
+  "confidence": {
+    "enabled": true,
+    "mode": "shadow",
+    "auto_above": 3.5,
+    "confirm_below": 2.5,
+    "abort_below": 1.2,
+    "interactive_timeout": 60,
+    "max_low_conf_streak": 3
+  },
+  "env_guard": {"enabled": true},
+  "checkpoint": {"enabled": true, "keep": 20}
 }
 ```
 
@@ -421,6 +491,13 @@ python main_task.py --health-reset    # 人工复核后：恢复被自动遗忘�
 | `task_flow_path` | 任务流程文件路径 |
 | `verify_timeout` | 单条结果校验的轮询上限秒数（v3.4.1） |
 | `verify_interval` | 结果校验轮询间隔秒数（v3.4.1） |
+| `confidence.mode` | `off` / `shadow`（默认，只看不拦）/ `adaptive`（该问就问）（v3.5.0） |
+| `confidence.*_below` | 三档分界线：`auto_above` 3.5 / `confirm_below` 2.5 / `abort_below` 1.2（v3.5.0） |
+| `confidence.interactive_timeout` | 介入弹窗等待秒数，超时按默认项处理（v3.5.0） |
+| `confidence.max_low_conf_streak` | 连续多少步低置信就提醒你（v3.5.0） |
+| `env_guard.enabled` | 是否启用环境守卫（登录页/错误页/弹窗/掉线检测）（v3.5.0） |
+| `checkpoint.enabled` / `keep` | 是否记录检查点、保留条数（回滚用，环形上限）（v3.5.0） |
+| `step_stats_path` / `stats_min_samples` | 步骤战绩文件位置与样本门槛（v3.5.0） |
 
 ## 10. 后台/静默运行
 
@@ -541,36 +618,50 @@ python scripts/chat_mode.py "回放"                          # 回放最近一�
 
 ## 16. 目录结构
 
-autopilot-composer-3.4.1/
+autopilot-composer-3.5.0/
 ├── SKILL.md                 # 本文档
 ├── docs/
 │   ├── t1-direct-layer.md   # T1 直连层使用指南（API 模板/凭证管理/SQL 安全/Tier 降级）
-│   └── verify-and-health.md # 结果校验 + 元素库健康度指南（配方与排错）
+│   ├── verify-and-health.md # 结果校验 + 元素库健康度指南（配方与排错）
+│   └── confidence-and-intervention.md # 置信度驱动的自适应执行（信号/模式/环境守卫/回滚/学术溯源）
 ├── 小白使用说明.md           # 零基础快速上手手册
 ├── scripts/
-│   ├── main_task.py         # 任务编排入口（播放 + 结果校验 + 健康度落盘 + --health/--reset）
-│   ├── cdp_engine.py        # 浏览器 CDP 引擎（播放端，多策略定位 / 定位器健康度记账 / 校验探针）
+│   ├── main_task.py         # 任务编排入口（T1 优先 + 结果校验 + 置信度评分 + 自适应介入 + --health/--reset）
+│   ├── cdp_engine.py        # 浏览器 CDP 引擎（多策略定位 / 定位器健康度记账 / 校验探针 / avoid 策略轮换）
 │   ├── gui_engine.py        # 桌面 GUI 引擎（播放端）
 │   ├── recorder.py          # 网页录制器 v2（导出 task_flow + 元素库 + Playwright）+ InteractiveRecorder 实时确认
-│   ├── browser_launcher.py  # 自带浏览器启动 器（一键拉起 Chrome 调试实例）
-│   ├── confirm_box.py       # 系统 GUI 确认弹窗（录制逐步确认）
+│   ├── browser_launcher.py  # 自带浏览器启动器（一键拉起 Chrome 调试实例）
+│   ├── confirm_box.py       # 系统 GUI 弹窗（录制逐步确认 + 回放自适应介入 ask_choice）
 │   ├── chat_mode.py         # 对话驱动入口（自然语言意图分发）
 │   ├── preset_elements.json # 预置元素库（常见站点多策略定位器）
-│   ├── desktop_recorder.py  #  * 桌面应用录制器
+│   ├── desktop_recorder.py  # 桌面应用录制器
 │   ├── record_session.py    # 合并录制会话
 │   ├── e2e_v341_test.py     # v3.4.1 离线验证（结果校验 + 元素库健康度，33 项断言，免浏览器）
+│   ├── e2e_v350_test.py     # v3.5.0 离线验证（置信度/环境守卫/战绩/检查点/主循环，73 项断言）
 │   ├── config.json / breakpoint.json / task_flow.json
 │   ├── core/                # 核心模块（actions / locator / observer / op_log / components / element_repo
 │   │                        #   + T1 直连层：api_client / api_registry / cli_executor / cli_registry /
 │   │                        #     db_client / db_registry / db_security / credential_manager /
 │   │                        #     network_capture / tier_resolver
-│   │                        #   + 可靠性层：verify（结果校验器））
+│   │                        #   + 可靠性层：verify（结果校验）/ confidence（置信度评分）/
+│   │                        #     env_guard（环境守卫）/ step_stats（步骤战绩）/ checkpoint（检查点回滚））
 │   └── requirements.txt
 
 
 ```
 
 ## 17. 版本记录
+
+- **3.5.0**（置信度驱动的自适应执行）——借鉴 OS-Kairos（ACL 2025 Findings, arXiv:2503.16465）的「自适应人机协作」机制，移植为**零模型的确定性版本**（本机 2 核 Pentium / 8GB / 核显无法运行 VLM）：
+  1. `core/confidence.py` 置信度评分器：用 8 类确定性信号（Tier 层级 / 定位唯一性 / 定位策略秩 / 元素健康度 / 步骤历史成功率 / 是否配 verify / 环境状态）合成 0~5 分，每一分都能追溯到具体信号；三档动作（自动 / 确认 / 中止）+ 三种模式（`off` / `shadow` 默认只看不拦 / `adaptive` 该问就问）。
+  2. `core/env_guard.py` 环境守卫：识别被踢回登录页 / 跳到错误页 / 意外弹窗 / 调试通道断开；**浅检**（每步执行前，只读 URL，零误报）与**深检**（诊断时，含 DOM 探测弹窗与密码框）两档以平衡开销；会话过期时明确返回「需人工登录」，**不假装能自愈**；弹窗与错误页可尝试自动恢复。
+  3. **策略轮换重试**：重试不再原样重跑同一动作，而是换做法（换定位策略 / 修环境），且顺序**自适应**——环境异常时先修环境，环境正常时才先换定位策略。
+  4. `core/checkpoint.py` 检查点与回滚：每步成功后记录 URL/标题（环形保留 20 条，不截图以省磁盘与算力），失败诊断时回退到上一个已知良好状态；与 `breakpoint.json` 互补（后者管「跑到第几步」，前者管「页面被带偏了」）。
+  5. `core/step_stats.py` 步骤战绩：按步骤指纹（忽略 id/ts/status 等易变字段）累计成功/失败，为置信度提供先验；样本 < 2 时不给判断，避免「一次失败被永久打标签」。
+  6. `confirm_box.py` 新增 `ask_choice` 多选项确认框（继续 / 跳过 / 暂停，含倒计时默认项与无 GUI 环境的命令行降级）。
+  7. `main_task.py` 主循环重构：执行前预探测并**复用于执行阶段**（不额外增加 CDP 往返）、置信度评分与归因展示、自适应介入、策略轮换、失败诊断（先排除环境问题再指向元素/业务问题）；`--health` 增加步骤战绩视图。
+  8. 修复：`element_repo.inc_used` 在元素条目缺少 `used` 字段时抛 `KeyError`（手工编辑或第三方生成的元素库会踩中，表现为重试路径直接崩）；`ensure_health` 现会补齐该字段。
+  9. 验证：新增 `scripts/e2e_v350_test.py`（**73 项离线断言**，免浏览器免 GPU，覆盖评分/守卫/战绩/检查点/主循环五组）；v3.4.1 的 33 项回归全部通过。文档：新增 `docs/confidence-and-intervention.md`，小白手册升级至 v3.5.0（新增第 9 节「它会自己琢磨这一步有没有把握」+ FAQ Q12~Q14）。
 
 - **v3.4.1（2026-09-15）可靠性升级：结果校验 + 元素库自愈（不依赖 GPU / 纯 Python）**：机制灵感来自 GUI-Agent-Harness 的 Observe→**Verify**→Plan→Dispatch 循环与「视觉记忆自动遗忘」，但按本技能「低配 Windows + 零基础用户 + 确定性可审计」的定位做了取舍（不引入 VLM / PyTorch / Node 运行时）。① **步骤级结果校验**（新增 `core/verify.py`）——步骤可写 `verify` 规格，执行后校验「是否真的生效」而非默认成功，覆盖 11 种校验：`element_exists/element_absent/element_count/text_present/text_absent/url_contains/url_equals/element_value_equals/element_value_contains/window_title/file_exists`；支持数组（全部通过）、按 `timeout` 轮询应对异步渲染、浏览器未连接时标记「跳过」而不误判。校验不过按失败处理 → 重试 →（T1 路径则**降级到界面路径**，解决「接口返回 200 但界面没变化」）→ 仍不过则写断点暂停。② **元素库健康度 + 自动遗忘**（`core/element_repo.py` + `cdp_engine.resolve_locator`）——定位器级：某策略连续未命中达 5 次自动遗忘（跳过探测）；元素级：连续 15 次未命中标记 `stale` 待复核（不删除，保留人工复核）；**任一命中即复活**（界面改回原样可自愈）；全部策略被遗忘时兜底回退原顺序（有线索总比直接失败好）。③ **可观测性**——`python main_task.py --health` 打印体检报告（健康/待复核/最弱元素，区分「尚未回放过」），`--health-reset` 人工复核后一键恢复；校验失败会计入元素库 miss（把「定位器选错了」变成可归因数据）；统计每 20 步 + 结束/失败时落盘（`skip_presets` 不污染用户库）。④ **schema**——`Action` 新增 `verify` 字段（序列化往返 + 导出 task_flow），`describe_action` 的 `comment` 自动追加「〔校验：…〕」摘要；`config.json` 新增 `verify_timeout`/`verify_interval`。⑤ **离线验证** `scripts/e2e_v341_test.py`——33 项断言全过（免浏览器：健康度生命周期 A1-A14、定位器联动 B1-B5、11 种校验+调度 C1-C4、schema D1-D4、主流程集成 E1-E6，含「T1 成功但校验不过 → 自动降级 T2」）。⑥ **向后兼容**——旧 `elements.json` 自动补齐健康字段，无 `verify` 字段的流程行为完全不变（绝不让新机制误拦正常流程）。文档：新增 `docs/verify-and-health.md`，`小白使用说明.md` 升级 v3.4.1。
 - **3.1.0** 桌面 GUI + 浏览器 CDP 双引擎、断点续跑、自动重试、运行日志、后台静默运行。

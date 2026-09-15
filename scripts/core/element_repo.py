@@ -121,7 +121,8 @@ class ElementRepository:
     def inc_used(self, eid):
         el = self.elements.get(eid)
         if el:
-            el["used"] += 1
+            # 用 get 兜底：兼容缺 used 字段的旧库/手工库（否则重试路径会 KeyError）
+            el["used"] = el.get("used", 0) + 1
 
     # ---------------- 健康度跟踪（v3.4.1） ----------------
 
@@ -130,6 +131,7 @@ class ElementRepository:
         """兼容旧元素库：补齐健康字段（原地修改并返回）。"""
         if not el:
             return el
+        el.setdefault("used", 0)   # 手工编辑/第三方生成的库可能缺这个字段
         el.setdefault("hit_count", 0)
         el.setdefault("miss_streak", 0)
         el.setdefault("last_ok_ts", None)

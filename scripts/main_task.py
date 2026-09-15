@@ -24,6 +24,24 @@ v3.4.1 新增两项可靠性机制：
   2) 元素库健康度 + 自动遗忘：定位器命中/未命中计数，连续失败的策略自动
      stale（跳过），元素连续 15 次未命中标记待复核，任一命中即复活
      （见 core/element_repo.py，用 `python main_task.py --health` 查看）。
+
+v3.5.0 新增「置信度驱动的自适应执行」——借鉴 OS-Kairos（ACL 2025 Findings,
+arXiv:2503.16465）的核心洞察：GUI 智能体最大的可靠性问题是 **过度执行**，
+即缺乏把握时仍全自动盲目执行；论文实证「何时介入」比「要不要介入」更关键
+（自适应介入 88.20% vs 每步都问人 62% vs 全自动 14.29%）。本版把该机制移植
+到确定性 RPA，**不依赖任何模型**：
+  1) 确定性置信度（core/confidence.py）：用 Tier 层级、定位器唯一性/策略、
+     元素库健康度、步骤历史成功率、是否配校验、环境状态合成 0~5 分，
+     三项都能追溯到具体信号 —— 可解释、可复现、零算力。
+  2) 环境守卫（core/env_guard.py）：识别「被踢回登录页 / 跳到错误页 /
+     意外弹窗 / 调试通道断开」这类环境劫持（最隐蔽的故障：后续步骤会在
+     错误页面上假装成功），并尝试轻量自愈。
+  3) 策略轮换重试（本文件 _switch_strategy）：重试不再原样重跑同一个动作，
+     而是逐轮换做法——换定位器策略 → 环境修复后重新定位，直击「盲目执行」。
+  4) 检查点回滚（core/checkpoint.py）：记录每步成功后的页面状态，失败诊断
+     时回退到上一个已知良好状态，避免在错误路径上继续叠加错误。
+  5) 步骤战绩（core/step_stats.py）：按步骤指纹累计成功/失败次数，给置信度
+     提供「同一份流程反复回放的真实战绩」这一模型没有的先验。
 """
 import json
 import time
@@ -43,6 +61,11 @@ from core.api_registry import ApiRegistry
 from core.cli_registry import CliRegistry
 from core.db_registry import DbRegistry
 from core.verify import Verifier
+from core.confidence import ConfidenceScorer, parse_tier
+from core.env_guard import EnvironmentGuard
+from core.step_stats import StepStats
+from core.checkpoint import CheckpointStore
+from confirm_box import ask_choice
 
 
 logging.basicConfig(
@@ -92,6 +115,23 @@ class BreakPointTaskRunner:
             cli_registry=self.cli_registry.templates if self.cli_registry else {},
             db_registry=self.db_registry.connections if self.db_registry else {},
         )
+
+        # ---- v3.5.0 可靠性四件套 ----
+        # 步骤战绩（置信度的历史先验：同一份流程反复回放的真实成功/失败次数）
+        self.stats = StepStats.load(
+            self.cfg.get("step_stats_path", "./step_stats.json"),
+            min_samples=self.cfg.get("stats_min_samples", 2))
+        # 环境守卫（登录页过期 / 错误页 / 意外弹窗 / 调试通道断开）
+        self.env_guard = EnvironmentGuard(self.cfg.get("env_guard") or {})
+        # 置信度评分器（确定性版的自适应人机协作，零模型）
+        self.scorer = ConfidenceScorer(self.cfg.get("confidence") or {},
+                                       repo=self.repo, stats=self.stats,
+                                       env_guard=self.env_guard)
+        # 检查点（用于「陷入错误路径」时的回滚）
+        self.ck_cfg = self.cfg.get("checkpoint") or {}
+        self.checkpoints = CheckpointStore(
+            self.cfg.get("checkpoint_path", "./checkpoints.json"),
+            keep=self.ck_cfg.get("keep", 20))
 
     def load_config(self):
         with open("config.json", "r", encoding="utf-8") as f:
@@ -144,6 +184,67 @@ class BreakPointTaskRunner:
         self.break_data["total_step"] = len(task_list)
         return task_list
 
+    # ---------------- v3.5.0：置信度信号预探测 ----------------
+    def _probe_signals(self, step, action):
+        """执行前收集置信度评分所需的确定性信号。
+
+        顺带把「将要使用的定位器」缓存到 action._pre_sel，供执行阶段复用 ——
+        否则同一步会为评分多做一轮 CDP 定位，白白变慢。
+        """
+        sig = {
+            "tier": parse_tier(self.tier_resolver.describe_tier(step)),
+            "has_verify": bool(step.get("verify")),
+            "history_rate": self.stats.success_rate(step),
+            "probe": {},
+            "element": None,
+            "env": {"kind": "ok", "skipped": True},
+        }
+        # 环境浅检只对浏览器步骤做（桌面步骤可能根本没有浏览器在跑）
+        if action.type == "browser":
+            try:
+                sig["env"] = self.env_guard.check(self.browser, deep=False)
+            except Exception:
+                sig["env"] = {"kind": "ok", "skipped": True}
+
+        if action.type != "browser":
+            return sig
+
+        el = self.repo.get(action.element_ref) if action.element_ref else None
+        if el:
+            sig["element"] = el
+            try:
+                sel = self.browser.resolve_locator(el)
+            except Exception:
+                sel = None
+            info = getattr(self.browser, "last_resolve", None) or {}
+            if sel:
+                action._pre_sel = sel
+                strat = info.get("strategy") or self._strategy_of(el, sel)
+                # 预先把「将要使用的策略」记下来，供策略轮换与校验失败归因复用
+                action._resolved_strategy = strat
+                sig["probe"] = {
+                    "found": True,
+                    "count": info.get("count") or 1,
+                    "strategy": strat,
+                    "source": "repo",
+                    "used_stale": bool(info.get("used_stale")),
+                }
+            else:
+                sig["probe"] = {"found": False, "source": "repo"}
+        elif action.params and action.func in ("click_elem", "input_text",
+                                               "hover", "upload_file"):
+            # 没有 element_ref：探测内联选择器的匹配数量（衡量回退路径的质量）
+            sel0 = action.params[0]
+            if isinstance(sel0, str) and sel0:
+                try:
+                    p = self.browser._probe(sel0)
+                    sig["probe"] = {"found": bool(p.get("found")),
+                                    "count": int(p.get("count") or 0),
+                                    "source": "inline"}
+                except Exception:
+                    sig["probe"] = {"source": "inline"}
+        return sig
+
     # ---------------- 执行分发 ----------------
     def _verify(self, action, step_info):
         """执行步骤级结果校验（v3.4.1）。
@@ -171,8 +272,11 @@ class BreakPointTaskRunner:
         logging.info("步骤结果校验通过：%s" % res.get("detail", ""))
         return res
 
-    def run_single_step(self, step_info):
-        action = Action.from_dict(step_info)
+    def run_single_step(self, step_info, action=None):
+        # v3.5.0：允许调用方传入既有 action 对象，让置信度预探测缓存的定位器
+        # （action._pre_sel）能在执行阶段复用，避免重复定位。
+        if action is None:
+            action = Action.from_dict(step_info)
         t0 = time.time()
         try:
             # T1 直连层优先：若步骤本身是 api/cli/sql，或 browser/gui 有 t1_ref
@@ -234,6 +338,12 @@ class BreakPointTaskRunner:
           - 命中 → record_hit（miss_streak 归零，复活已遗忘元素）
           - 未命中 → record_miss（连续 miss 达阈值即标记 stale，回放时提示复核）
         """
+        # v3.5.0：复用执行前预探测的结果（置信度评分已经定位过一次），
+        # 避免同一步为评分而多做一轮 CDP 定位
+        pre = getattr(action, "_pre_sel", None)
+        if pre:
+            action._pre_sel = None
+            return pre
         if action.element_ref:
             el = self.repo.get(action.element_ref)
             if el:
@@ -418,6 +528,221 @@ class BreakPointTaskRunner:
         except Exception as e:
             logging.warning("元素库落盘失败: %s" % e)
 
+    # ---------------- v3.5.0：置信度驱动的自适应执行 ----------------
+    def _announce_modes(self):
+        """启动时说明当前处于哪种可靠性模式（不让用户猜）。"""
+        m = self.scorer.mode
+        if not self.scorer.enabled or m == "off":
+            print("   置信度评估：关闭")
+        elif m == "shadow":
+            print("   置信度评估：观察模式 —— 只评分与告警，绝不打断（想让它在低置信时"
+                  "弹窗问你，把 config.json 的 confidence.mode 改成 adaptive）")
+        else:
+            print("   置信度评估：自适应介入 —— 低置信会弹窗确认，极低置信直接暂停")
+        if self.ck_cfg.get("enabled", True):
+            print("   环境守卫 + 检查点回滚：已启用")
+
+    def _maybe_intervene(self, conf, desc, idx, total):
+        """置信度驱动的自适应介入。返回 continue / skip / pause。
+
+        这就是 OS-Kairos 的 confidence-driven interaction：把「要不要继续」
+        的决定权，在**该犹豫的那几步**交还给人类 —— 不是每步都问，也不是
+        从不问（论文实测：每步都问 62% vs 自适应 88.20% vs 全自动 14.29%）。
+        """
+        if not conf:
+            return "continue"
+        act = conf["action"]
+        low = conf["level"] in ("low", "critical")
+        streak_hit = self.scorer.note_low(low)
+        if act == "auto":
+            if streak_hit:
+                print("     ⚠️ 已连续 %d 步置信度偏低，建议停下来看看"
+                      "（`python main_task.py --health` 可体检元素库）。"
+                      % self.scorer.low_streak)
+            return "continue"
+
+        headline = "置信 %.2f/5 %s —— 这一步可能不可靠" % (conf["score"], conf["level_label"])
+        lines = list(conf.get("explain") or [])
+        if act == "abort":
+            # 极低置信：连「继续执行」都不提供，只允许跳过或暂停
+            options = [{"label": "跳过这步", "value": "skip"},
+                       {"label": "暂停任务", "value": "pause"}]
+            default_index = 1
+            message = ("步骤 %d/%d：%s\n\n置信度过低（存在不可逆风险），默认不执行。"
+                       % (idx + 1, total, desc))
+        else:
+            options = [{"label": "继续执行", "value": "continue"},
+                       {"label": "跳过这步", "value": "skip"},
+                       {"label": "暂停任务", "value": "pause"}]
+            default_index = 0
+            message = "步骤 %d/%d：%s" % (idx + 1, total, desc)
+        self.scorer.interventions += 1
+        choice = ask_choice(message, title="AutoPilot 回放确认", options=options,
+                            timeout=self.scorer.interactive_timeout,
+                            detail_lines=lines, headline=headline,
+                            default_index=default_index)
+        logging.info("人工介入决策：步骤%d → %s（置信 %.2f / %s）"
+                     % (idx + 1, choice, conf["score"], conf["level"]))
+        return choice if choice in ("skip", "pause") else "continue"
+
+    def _after_step_ok(self, idx, action, desc):
+        """步骤成功后的收尾：断点 + 检查点。"""
+        self.save_breakpoint(idx + 1, "running")
+        if self.ck_cfg.get("enabled", True):
+            url = ""
+            if action.type == "browser":
+                try:
+                    url = self.browser.current_url()
+                except Exception:
+                    url = ""
+            self.checkpoints.record_ok(idx + 1, url=url, desc=desc)
+
+    def _switch_strategy(self, action, attempt, idx, total, env_kind="ok"):
+        """策略轮换：把该步换成**另一种做法**。返回 True 表示确实换了。
+
+        直击 OS-Kairos 批评的 over-execution ——「在不确定时反复执行同一个
+        动作」既浪费时间又可能造成不可逆后果。
+
+        轮换顺序是**自适应**的：环境明显异常时先修环境（在登录页/错误页上
+        换定位器毫无意义），环境正常时才先换定位器（那多半是元素本身变了）。
+        两类候选：
+          repair   —— 环境修复（关闭弹窗 / 回滚页面 / 重载）
+          relocate —— 换一个定位器策略（避开刚失败的那个）
+        """
+        if action.type != "browser" or not action.element_ref:
+            return False
+        el = self.repo.get(action.element_ref)
+        if not el:
+            return False
+
+        order = (["repair", "relocate"] if env_kind not in (None, "ok")
+                 else ["relocate", "repair"])
+        pick = order[attempt - 1] if attempt - 1 < len(order) else order[-1]
+
+        if pick == "repair":
+            if self._repair_environment(idx, total):
+                action._pre_sel = None
+                action._resolved_strategy = None
+                return True
+            pick = "relocate"   # 环境修不了，退而换定位器
+
+        info = getattr(self.browser, "last_resolve", None) or {}
+        used = getattr(action, "_resolved_strategy", None) or info.get("strategy")
+        avoid = {used} if used else set()
+        try:
+            sel = self.browser.resolve_locator(el, avoid=avoid)
+        except Exception:
+            sel = None
+        if not sel:
+            return False
+        new_strat = (getattr(self.browser, "last_resolve", None) or {}).get("strategy")
+        action._pre_sel = sel
+        action._resolved_strategy = None
+        print("     ↻ 换一种定位方式重试：「%s」→「%s」"
+              % (used or "?", new_strat or "?"))
+        return True
+
+    def _repair_environment(self, idx, total):
+        """尝试把环境恢复到可用状态。返回是否真的做了动作。"""
+        kind = "ok"
+        try:
+            kind = (self.env_guard.check(self.browser, deep=True) or {}).get("kind") or "ok"
+        except Exception:
+            kind = "ok"
+        if kind != "ok":
+            ck = self.checkpoints.last_good(need_url=True)
+            r = self.env_guard.recover(self.browser, kind, checkpoint=ck)
+            if r.get("ok"):
+                print("     ↻ 环境已自愈（%s：%s）后重试" % (r.get("action"), r.get("detail")))
+            else:
+                print("     ↻ 环境异常未能自动修复（%s），仍尝试重试" % r.get("detail"))
+            return True
+        # 环境正常但仍失败：动态渲染未就绪很常见，重载一次往往就好
+        try:
+            if self.browser.current_url():
+                self.browser.send_cmd("Page.reload", {"ignoreCache": False})
+                time.sleep(1.5)
+                print("     ↻ 已重载页面并重新定位后重试")
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _diagnose_failure(self, action, idx, err_info, tried_rotation=False):
+        """重试全部失败后的诊断：说清「为什么」和「现在该做什么」。"""
+        print("\n❌ 步骤 %d 已重试 %d 次仍失败，任务暂停。" % (idx + 1, self.max_retry))
+        if err_info:
+            print("   最后错误：%s" % str(err_info)[:160])
+        kind = "ok"
+        if action is not None and action.type == "browser":
+            try:
+                st = self.env_guard.check(self.browser, deep=True)
+                kind = st.get("kind") or "ok"
+                if kind != "ok":
+                    print("   🔎 环境诊断：%s" % (st.get("detail") or kind))
+                    r = self.env_guard.recover(self.browser, kind,
+                                               checkpoint=self.checkpoints.last_good(need_url=True))
+                    print("   %s 自动恢复：%s —— %s"
+                          % ("✅" if r.get("ok") else "⚠️", r.get("action"), r.get("detail")))
+                    if r.get("ok"):
+                        print("   👉 环境已恢复，直接 `python main_task.py` 就能从该步续跑。")
+            except Exception as e:
+                print("   🔎 环境诊断失败：%s" % str(e)[:120])
+        if kind == "ok":
+            print("   🔎 环境诊断：页面状态正常 → 问题更可能出在这一步的元素定位或业务前置条件。")
+            if tried_rotation:
+                print("   （已尝试过更换定位策略、修复页面环境等替代做法，说明不是偶发抖动）")
+            print("   👉 建议：`python main_task.py --health` 体检元素库；确认前置条件后"
+                  "`python main_task.py` 从该步续跑。")
+        print("   失败详情见 run_log.log。")
+
+    def _persist(self):
+        """统一落盘（操作日志 / 元素库 / 步骤战绩 / 检查点）。"""
+        for fn in (self.oplog.save, self._save_repo, self.stats.save,
+                   self.checkpoints.save):
+            try:
+                fn()
+            except Exception:
+                pass
+
+    def _run_step_with_rotation(self, step, action, idx, total, desc, tier, conf):
+        """执行一步；失败时**每次换一种做法**重试。返回 (success, err_info)。"""
+        attempts = max(1, int(self.max_retry))
+        last_err = ""
+        for attempt in range(1, attempts + 1):
+            try:
+                self.run_single_step(step, action)
+            except Exception as e:
+                last_err = "步骤%d异常：%s" % (idx, str(e))
+                logging.error(last_err)
+                # 失败也要记战绩：置信度的历史先验就来自这里
+                self.stats.record(step, False, desc, err=str(e))
+                if attempt >= attempts:
+                    break
+                env_kind = "ok"
+                if conf and conf.get("signals"):
+                    env_kind = conf["signals"].get("env") or "ok"
+                switched = self._switch_strategy(action, attempt, idx, total,
+                                                 env_kind=env_kind)
+                if not switched:
+                    print("  \u26a0\ufe0f \u6b65\u9aa4 %d/%d  [%s] {%s} \u91cd\u8bd5 %d/%d\uff1a%s"
+                          % (idx + 1, total, desc, tier, attempt, attempts, str(e)[:80]))
+                time.sleep(1.5)
+                continue
+
+            # ---- 成功 ----
+            self._after_step_ok(idx, action, desc)
+            self.stats.record(step, True, desc)
+            tail = ("  " + self.scorer.short(conf)) if conf else ""
+            print("  \u2705 \u6b65\u9aa4 %d/%d  [%s] {%s}%s"
+                  % (idx + 1, total, desc, tier, tail))
+            if step.get("verify"):
+                print("     \u2714 \u7ed3\u679c\u6821\u9a8c\u901a\u8fc7")
+            time.sleep(self.cfg["delay_base"])
+            logging.info("步骤%d执行成功" % idx)
+            return True, ""
+        return False, last_err
+
     def start_run(self):
         task_flow = self.load_task_flow()
         start_idx = self.break_data["current_step"]
@@ -425,6 +750,7 @@ class BreakPointTaskRunner:
             print("⏯ 断点续跑：从步骤 %d/%d 继续" % (start_idx, len(task_flow)))
         else:
             print("▶ 开始回放：共 %d 步" % len(task_flow))
+        self._announce_modes()
 
         for idx in range(start_idx, len(task_flow)):
             step = task_flow[idx]
@@ -435,44 +761,67 @@ class BreakPointTaskRunner:
                 continue
             desc = self._step_desc(step)
             tier = self.tier_resolver.describe_tier(step)
-            retry = 0
-            success = False
-            err_info = ""
-            while retry < self.max_retry:
+            action = Action.from_dict(step)
+
+            # ---- 1) 执行前：置信度评分（确定性信号，零模型） ----
+            conf = None
+            if self.scorer.enabled and self.scorer.mode != "off":
                 try:
-                    self.run_single_step(task_flow[idx])
-                    success = True
-                    self.save_breakpoint(idx + 1, "running")
-                    print("  \u2705 \u6b65\u9aa4 %d/%d  [%s] {%s}" % (idx + 1, len(task_flow), desc, tier))
-                    if step.get("verify"):
-                        print("     \u2714 \u7ed3\u679c\u6821\u9a8c\u901a\u8fc7")
-                    time.sleep(self.cfg["delay_base"])
-                    logging.info("步骤%d执行成功" % idx)
-                    break
+                    conf = self.scorer.score(step, self._probe_signals(step, action))
                 except Exception as e:
-                    retry += 1
-                    err_info = "步骤%d异常：%s" % (idx, str(e))
-                    logging.error(err_info)
-                    print("  \u26a0\ufe0f \u6b65\u9aa4 %d/%d  [%s] {%s} \u91cd\u8bd5 %d/%d\uff1a%s"
-                          % (idx + 1, len(task_flow), desc, tier, retry, self.max_retry, str(e)[:80]))
-                    time.sleep(2)
-            # 每 20 步落盘一次元素库健康度，避免中途崩溃丢失统计
+                    logging.warning("置信度评分失败（不影响执行）：%s" % e)
+            if conf and conf["level"] in ("low", "critical"):
+                print("  %s 步骤 %d/%d  [%s] {%s}  %s"
+                      % ("\u26d4" if conf["level"] == "critical" else "\u26a0\ufe0f",
+                         idx + 1, len(task_flow), desc, tier, self.scorer.short(conf)))
+                for ln in self.scorer.detail_lines(conf):
+                    print(ln)
+
+            # ---- 2) 自适应介入：该犹豫时把决定权交还给人 ----
+            decision = self._maybe_intervene(conf, desc, idx, len(task_flow))
+            if decision == "skip":
+                print("     ⏭️ 已按你的选择跳过该步")
+                self.save_breakpoint(idx + 1, "running")
+                continue
+            if decision == "pause":
+                self.save_breakpoint(idx, "paused",
+                                     "置信度不足，用户选择暂停（步骤 %d）" % (idx + 1))
+                self._persist()
+                print("\n⏸ 已暂停。处理好后执行 `python main_task.py` 从该步续跑。")
+                return
+
+            # ---- 3) 执行 + 策略轮换重试 ----
+            success, err_info = self._run_step_with_rotation(
+                step, action, idx, len(task_flow), desc, tier, conf)
+
+            # 每 20 步落盘一次，避免中途崩溃丢失统计
             if (idx + 1) % 20 == 0:
-                self._save_repo()
+                self._persist()
             if not success:
                 self.save_breakpoint(idx, "error", err_info)
-                self.oplog.save()
-                self._save_repo()
-                print("\n❌ 步骤 %d 多次重试失败，任务暂停。可用 `python main_task.py --reset` 重置后重跑。" % (idx + 1))
-                print("   失败详情已写入 run_log.log")
+                self._persist()
+                self._diagnose_failure(action, idx, err_info, tried_rotation=True)
                 return
+
         self.save_breakpoint(0, "finish")
-        self.oplog.save()
-        self._save_repo()
+        self._persist()
         print("\n🎉 全部 %d 步执行完成。" % len(task_flow))
         if self._verify_count or self._verify_skipped:
-            print("   \u7ed3\u679c\u6821\u9a8c\uff1a\u901a\u8fc7 %d \u9879\uff0c\u8df3\u8fc7 %d \u9879"
+            print("   结果校验：通过 %d 项，跳过 %d 项"
                   % (self._verify_count, self._verify_skipped))
+        # 置信度汇报：把「哪几步心里没底」摊开给用户
+        try:
+            s = self.scorer.summary()
+            if s:
+                b = s["buckets"]
+                print("   置信度：平均 %.2f/5（高 %d / 中 %d / 偏低 %d / 极低 %d），人工介入 %d 次"
+                      % (s["avg"], b["high"], b["medium"], b["low"],
+                         b["critical"], s["interventions"]))
+                if s["low_count"]:
+                    print("   ⚠️ 有 %d 步置信度偏低，建议 `python main_task.py --health`"
+                          " 体检元素库" % s["low_count"])
+        except Exception:
+            pass
         # 元素库健康度提醒（自动遗忘的条目需人工复核）
         try:
             hr = self.repo.health_report()
@@ -530,6 +879,22 @@ if __name__ == "__main__":
         if hr["stale"]:
             print("\n提示：被自动遗忘的元素在回放时会跳过对应定位器，"
                   "确认界面已恢复后执行 `python main_task.py --health-reset` 复活。")
+
+        # 步骤战绩（v3.5.0）：哪几步历史上最容易失败
+        try:
+            ss = StepStats.load(cfg.get("step_stats_path", "./step_stats.json")).summary()
+            if ss["steps"]:
+                print("\n步骤战绩：%d 个步骤有记录，累计成功 %d 次 / 失败 %d 次"
+                      % (ss["steps"], ss["runs_ok"], ss["runs_fail"]))
+                if ss["worst"]:
+                    print("最容易失败的步骤：")
+                    for w in ss["worst"][:5]:
+                        nm = w["desc"] or w["fp"]
+                        nm = nm[:30] + ("…" if len(nm) > 30 else "")
+                        print("  - %s  成功 %d / 失败 %d（成功率 %.0f%%）"
+                              % (nm, w["ok"], w["fail"], w["rate"] * 100))
+        except Exception:
+            pass
         sys.exit(0)
 
     runner = BreakPointTaskRunner()

@@ -14,5 +14,25 @@
   "cli_registry_path": "./cli_registry.json",
   "db_registry_path": "./db_registry.json",
   "verify_timeout": 5.0,
-  "verify_interval": 0.3
+  "verify_interval": 0.3,
+  "step_stats_path": "./step_stats.json",
+  "checkpoint_path": "./checkpoints.json",
+  "stats_min_samples": 2,
+  "confidence": {
+    "enabled": true,
+    "mode": "shadow",
+    "auto_above": 3.5,
+    "confirm_below": 2.5,
+    "abort_below": 1.2,
+    "interactive_timeout": 60,
+    "max_low_conf_streak": 3,
+    "tier_base": {"T1": 4.7, "T2": 4.2, "T3": 3.4, "T4": 1.8}
+  },
+  "env_guard": {
+    "enabled": true
+  },
+  "checkpoint": {
+    "enabled": true,
+    "keep": 20
+  }
 }

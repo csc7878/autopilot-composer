@@ -23,3 +23,6 @@ scripts/task_flow.json
 scripts/*_registry.json
 scripts/.credentials.json.enc*
 scripts/db_audit.log
+# v3.5.0 运行产物：步骤战绩 / 检查点（属运行时数据，不随技能发布）
+scripts/step_stats.json
+scripts/checkpoints.json

@@ -201,8 +201,12 @@ class CdpBrowserCtrl:
         except Exception:
             return None
 
-    def resolve_locator(self, element, priority=None, record=True):
+    def resolve_locator(self, element, priority=None, record=True, avoid=None):
         """给定元素库里的元素 dict，按 priority 依次尝试各定位器。
+
+        avoid: v3.5.0 策略轮换用。集合内的定位策略本次跳过——重试时换一种
+        定位方式，而不是把同一个动作原样重跑（对应 OS-Kairos 批评的
+        「blind execution / 过度执行」）。
 
         返回首个「能唯一匹配（count==1）」的 query；若都多匹配/未匹配，
         则 best-effort 返回第一个命中的 query；全失败返回 None。
@@ -219,6 +223,12 @@ class CdpBrowserCtrl:
             priority = WEB_PRIORITY
         if not element:
             return None
+        avoid = set(avoid or ())
+        # v3.5.0：记录本次解析的决策详情（供置信度评分使用）。置信度需要知道
+        # 「匹配到几个元素、用了哪个策略」，但不应为此多花一次 CDP 往返，
+        # 因此在既有探测过程中顺手记录。先置空，避免早退时残留上次的值。
+        self.last_resolve = {"query": None, "strategy": None, "found": False,
+                             "count": 0, "all_stale": False, "probed": []}
         locs = {}
         stale_strategies = set()
         for l in element.get("locators", []):
@@ -234,7 +244,7 @@ class CdpBrowserCtrl:
         # 第一轮：正常策略（跳过已遗忘的）
         for strat in priority:
             q = locs.get(strat)
-            if not q or (record and strat in stale_strategies):
+            if not q or (record and strat in stale_strategies) or strat in avoid:
                 continue
             try:
                 p = self._probe(q)
@@ -258,7 +268,7 @@ class CdpBrowserCtrl:
         if best is None and record and stale_strategies:
             for strat in priority:
                 q = locs.get(strat)
-                if not q or strat not in stale_strategies:
+                if not q or strat not in stale_strategies or strat in avoid:
                     continue
                 try:
                     p = self._probe(q)
