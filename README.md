@@ -1,4 +1,4 @@
-# AutoPilot Composer (v3.6.0)
+# AutoPilot Composer (v3.6.1)
 
 > 桌面 GUI（pyautogui）+ 浏览器 CDP 双引擎 RPA 框架：把「打开软件 → 点点鼠标 → 浏览器填表 → 截图留痕」的重复流程写成一份清单自动跑，**不会写代码也能用**。
 

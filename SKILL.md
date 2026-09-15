@@ -2,38 +2,40 @@
 name: AutoPilot Composer
 displayName: AutoPilot Composer
 slug: autopilot-composer
-version: 3.6.0
+version: 3.6.1
 runtime: python
+license: MIT
+homepage: https://github.com/csc7878/autopilot-composer
 tags:
   - automation
-  - cdp
-  - pyautogui
   - rpa
-  - desktop
-  - pipeline
-  - record
-  - element-repository
-  - components
-  - browser-launcher
-  - preset-elements
-  - tier-resolver
-  - api-direct
-  - sql-direct
-  - credential-manager
-  - network-capture
-  - result-verify
-  - element-health
+  - record-and-replay
+  - web-automation
+  - desktop-automation
+  - browser-automation
+  - workflow
+  - no-code
   - self-healing
-  - confidence-driven
-  - adaptive-intervention
-  - env-guard
-  - step-stats
-  - checkpoint-rollback
-  - auto-verify
-  - verify-candidates
-  - record-time-assertions
-  - proxy-bypass
-description: 桌面 GUI（pyautogui）+ 浏览器 CDP 双引擎 RPA，支持「录制→元素库→回放」原子动作建模、复用组件库、操作日志审计与流程挖掘、断点续跑与自动重试。v3.4.0 新增 T1 直连层（CLI/API/SQL），录制时自动捕获 UI 背后的 API 请求，回放时优先直调 API/CLI/SQL，失败自动降级到 GUI。v3.4.1 新增步骤级结果校验（verify，不再「点完就算成功」）与元素库健康度自愈。v3.5.0 新增置信度驱动的自适应执行：给每步打 0~5 分把握分（零模型，纯确定性信号合成），低置信时主动请求人工确认而不是盲目执行；识别登录页过期/错误页/意外弹窗等环境陷阱并尝试自愈；重试不再原样重跑而是自适应轮换策略。v3.6.0 新增录制时自动生成校验候选：录制过程顺手记下「这一步让页面发生了什么变化」（URL 跳转、录入值回读、反馈文案、弹窗、加载结束、窗口焦点），据此自动写出 verify 规格，免去手写；只断言录制时真实观测到的事实，易变文案与密码类字段一律不碰。对标影刀/UiPath 的企业级自动化能力。
+  - result-verify
+  - offline
+  - windows
+  - 自动化
+  - 机器人流程自动化
+  - 网页自动化
+  - 桌面自动化
+  - 办公自动化
+  - 录制回放
+  - 断点续跑
+  - 批量填表
+  - 表单填写
+  - 数据采集
+  - 网页抓取
+  - 报表下载
+  - 定时任务
+  - 无人值守
+  - 后台静默
+summary: 对着屏幕操作一遍它就会了——不用写代码的 RPA 机器人，网页与桌面软件都能自动跑。支持百级长流程、断点续跑、后台静默，关键步骤自动校验、出错自己换做法。批量填表、对账、数据搬运、定时任务开箱即用，纯本地运行、零 API 成本。
+description: 不用写代码的 RPA 机器人：对着屏幕正常操作一遍，它自动学会并生成可重复执行的流程，网页与企业微信/钉钉/WPS/金蝶等桌面软件混合跑。· 录制即生成流程——网页录制器与桌面录制器可同时录，自动合成一份流程清单并附人工可读的 SOP · 断点续跑——任何一步失败就停在原地写断点，修好接着跑，百级长流程不必重头来 · 关键步骤自动校验——录制时顺手记下「页面跳到哪了、值真的填进去了吗、有没有提示保存成功」，跑错立刻发现而不是一路错到底 · 越跑越稳——自动记住好用的元素定位，连续失效就弃用、页面改版回来又自动复活；对没把握的步骤会主动停下来问你 · 有更快的路就走——能直接调接口/命令/数据库的步骤跳过点界面，秒级变毫秒级，失败自动降级回点界面 · 纯本地零成本——不依赖大模型、无 API 费用，低配 Windows 也能跑，支持 pythonw 后台静默。典型场景：财务对账、批量填表与提交、报表下载整理、跨系统数据搬运、定时巡检。
 entry: ./scripts/main_task.py
 trigger:
   - 启动长任务自动化
@@ -714,7 +716,7 @@ python scripts/chat_mode.py "回放"                          # 回放最近一�
 
 ## 16. 目录结构
 
-autopilot-composer-3.6.0/
+autopilot-composer-3.6.1/
 ├── SKILL.md                 # 本文档
 ├── docs/
 │   ├── t1-direct-layer.md   # T1 直连层使用指南（API 模板/凭证管理/SQL 安全/Tier 降级）
@@ -755,6 +757,16 @@ autopilot-composer-3.6.0/
 ```
 
 ## 17. 版本记录
+
+- **3.6.1**（SkillHub 门面修复：概述与元数据，不改功能代码）——起因是发布页的「概述」区域显示的是 477 字的**逐版本更新日志**（"v3.4.0 新增…v3.4.1 新增…v3.5.0 新增…v3.6.0 新增…"），对第一次看到这个技能的人是无效信息：他们要先读完四代版本号才知道这东西能干什么。查了 SkillHub 平台侧的真实数据后重做门面：
+  1. **搞清平台实际读哪个字段**：`GET /api/v1/skills/<slug>?namespace=<ns>` 返回的 `skill.summary` / `summary_zh` 就是卡片与详情页展示的概述文本；`skill.overviewMd`（看起来像"概述正文"的字段）抽查 11 个榜单头部技能**全部为空**（含 120 万下载的第一名），说明该字段当前并不被使用或不可设置 —— 所以修概述就是修 frontmatter 的 `summary`。
+  2. **新增 `summary` 字段**（此前缺失，平台只能回退到 `description`）。控制在 **114 字**：SkillHub 榜单头部技能的 summary 长度区间是 **42~364 字、中位 ~159 字**，我们原来的 477 字是其中最长的。写法改为"先讲它替你省掉什么，再讲能力"，不出现任何版本号。
+  3. **重写 `description`** 为「一句钩子 + 6 条能力」结构，**前 170 字必须是完整钩子** —— 搜索结果卡片就截在这里（实测截断长度约 170 字），原来前 170 字是"桌面 GUI（pyautogui）+ 浏览器 CDP 双引擎 RPA，支持「录制→元素库→回放」原子动作建模…"这种术语堆叠，中文读者看不出价值。版本沿革从 description 中**整体删除**（它本来就在本节，且 `changelog` 字段已随每次发布单独上报），不再让历史挤占门面。
+  4. **补 `homepage` 与 `license`**：此前 homepage 为空（平台该字段实际会存 `https://api.skillhub.cn/<handle>/<slug>` 这类内部地址），现指向 GitHub 仓库；`license: MIT`。二者都会进入发布 payload（`publish` 的 multipart payload 含 slug/version/displayName/summary/description/tags/license/homepage/changelog 九项）。
+  5. **tags 从 28 个纯英文技术词改为 27 个"意图词"**：原来的 `element-repository` / `tier-resolver` / `preset-elements` / `step-stats` 这类是**实现细节**，没有人会这样搜；换成用户真实会输的词 —— `自动化` / `机器人流程自动化` / `网页自动化` / `桌面自动化` / `办公自动化` / `录制回放` / `断点续跑` / `批量填表` / `表单填写` / `数据采集` / `网页抓取` / `报表下载` / `定时任务` / `无人值守` / `后台静默`，同时保留 `rpa` / `record-and-replay` / `no-code` / `self-healing` 等高意图英文词。
+  6. **验证方式**：实测发布后用详情接口回读 `summary` / `description` / `tags` / `homepage` 是否已生效（`_sh_probe` / `_sh_mine` 一类脚本），不靠"发布成功"字样判断；本地用 `_check_fm.py` 校验 frontmatter 合法性与字段长度区间。
+  7. **本条也是"平台机制调研"的记录**：顺带反推出 SkillHub 榜单的排序口径（`score ≈ 793.5 × (下载 + 20×star)`，1 star 折 20 次下载，上限 100000）与各榜单准入门槛（`newest` 只收 24 小时内新建；`trending` ≥2,423 下载；`recommended` ≥16,749；`hot` ≥69,729），据此制定了增长路线（详见交付的增长诊断报告）。
+  8. **不含任何功能代码变更** —— 本次只动 frontmatter 与文档；275 项离线断言无需重跑（但发布前仍照惯例跑了一遍确认无回归）。
 
 - **3.6.0**（录制时自动生成校验候选 + 本机回环请求绕过代理）——起点是一个很具体的痛点：v3.4.1 有了步骤级校验，但**规格要手写**，实测「录 60 步能正确手写出校验的不到 10 步」，因为手写要求你回答「点完这个按钮页面变成了什么样」，而这恰恰是录制那一刻最容易知道、事后最想不起来的信息。录制器本来就知道答案，于是让它顺手写下来：
   1. `core/verify_advisor.py` 校验推断器（纯 Python、可离线测试）：从「动作事件 + 动作后探测」推断 `verify` 候选，六条规则 —— **URL 变化**（锚定新增路径段并剥掉 ID/时间戳，仅查询串变化不生成）、**录入回读**（回读值一致 → `element_value_equals`；包含 → `element_value_contains`；被页面规范化 → 按观测值断言）、**反馈文案**（动作后出现且动作前不存在的提示 → `text_present`）、**弹窗出现**（→ `element_exists`）、**加载结束**（→ `element_absent`，顺带等异步渲染）、**窗口焦点**（桌面动作 → `window_title`，用于确认没点错窗口）。
