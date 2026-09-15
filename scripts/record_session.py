@@ -39,6 +39,7 @@ from core.element_repo import ElementRepository
 from core.actions import actions_to_taskflow, describe_action
 from core.op_log import OperationLog
 from core.api_registry import ApiRegistry
+from core.verify_advisor import VerifyAdvisor
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +209,12 @@ def main():
     ap.add_argument("--py", default="recorded_desktop.py")
     ap.add_argument("--sop", default="SOP.md")
     ap.add_argument("--components-dir", default=os.path.join(HERE, "components"))
+    ap.add_argument("--verify", choices=("off", "auto", "all"), default="auto",
+                    help="自动生成步骤结果校验（verify）：off 不生成；"
+                         "auto（默认）只生成录制时直接观测到的高置信校验（URL 跳转/"
+                         "录入回读/反馈文案）；all 额外生成弹窗、加载遮罩、窗口标题类校验")
+    ap.add_argument("--verify-report", default="verify_candidates.md",
+                    help="校验候选人读报告的输出路径（--verify off 时不写）")
     args = ap.parse_args()
 
     do_web = not args.desktop_only
@@ -281,6 +288,20 @@ def main():
         _attach_t1_refs(task_flow, web_events,
                         web_rec.network_capture.get_api_events(), api_registry)
 
+    # v3.6.0：录制时自动生成 verify 候选（网页走 URL/反馈/回读规则，桌面走窗口标题规则）。
+    # 必须放在生成 SOP 之前：SOP 的步骤描述会带上「校验：…」，先算再写才对得上。
+    verify_adv = None
+    if args.verify != "off":
+        merged_events = sorted(web_events + desk_events, key=lambda e: e.get("ts", 0))
+        verify_adv = VerifyAdvisor(mode=args.verify)
+        verify_adv.attach(task_flow, merged_events)
+        # 把结果同步回 Action 对象（SOP 描述读的是 Action.verify）
+        by_ts = {s.get("ts"): s.get("verify") for s in task_flow
+                 if isinstance(s, dict) and s.get("verify")}
+        for a in all_actions:
+            if a.ts in by_ts:
+                a.verify = by_ts[a.ts]
+
     # ---- 写出新四件套 ----
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(task_flow, f, ensure_ascii=False, indent=2)
@@ -290,6 +311,13 @@ def main():
     sop = _sop_lines(all_actions, repo)
     with open(args.sop, "w", encoding="utf-8") as f:
         f.write("\n".join(sop) + "\n")
+
+    if verify_adv is not None:
+        try:
+            with open(args.verify_report, "w", encoding="utf-8") as f:
+                f.write(verify_adv.render_report(args.out) + "\n")
+        except Exception as e:
+            print("   ⚠️ 校验报告写入失败：%s" % e)
 
     # ---- 兼容导出（独立脚本） ----
     if do_web and web_events:
@@ -305,6 +333,11 @@ def main():
     print("   - %s   （人读 SOP 手册）" % args.sop)
     if api_registry and api_registry.templates:
         print("   - api_registry.json  （%d 个 API 模板，T1 直连层）" % len(api_registry.templates))
+    if verify_adv is not None:
+        rep = verify_adv.report or {}
+        print("   - %s  （自动生成校验：%d 步已写入 / 共推断 %d 条候选，模式 %s）"
+              % (args.verify_report, rep.get("applied", 0), rep.get("candidates", 0),
+                 args.verify))
     if do_web and web_events:
         print("   - %s   （网页 Playwright 脚本，兼容）" % args.js)
     if do_desk and desk_events:

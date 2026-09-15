@@ -24,6 +24,12 @@ import subprocess
 import urllib.request
 import argparse
 
+# 访问本机调试端口时绕过系统代理（详见 core/local_http.py）
+try:
+    from core.local_http import urlopen_local
+except ImportError:
+    urlopen_local = urllib.request.urlopen
+
 
 def find_chrome_executable():
     """跨平台查找 Chrome / Chromium 可执行文件。"""
@@ -64,8 +70,8 @@ def find_chrome_executable():
 def port_alive(port):
     """端口是否已存在可用调试实例。"""
     try:
-        with urllib.request.urlopen("http://127.0.0.1:%d/json/version" % port,
-                                    timeout=2) as r:
+        with urlopen_local("http://127.0.0.1:%d/json/version" % port,
+                           timeout=2) as r:
             data = json.load(r)
         return data.get("Browser") is not None
     except Exception:
@@ -84,16 +90,15 @@ def wait_port(port, timeout=15):
 
 def ensure_url(port, url):
     """复用模式下：若已有匹配 url 的标签页则激活，否则新建一个。"""
-    with urllib.request.urlopen("http://127.0.0.1:%d/json" % port, timeout=5) as r:
+    with urlopen_local("http://127.0.0.1:%d/json" % port, timeout=5) as r:
         targets = json.load(r)
     norm = (url or "").rstrip("/")
     for t in targets:
         if t.get("type") == "page" and (t.get("url") or "").rstrip("/") == norm:
             return {"action": "activated", "url": t.get("url")}
     # 没有则新建
-    req = urllib.request.Request(
-        "http://127.0.0.1:%d/json/new?%s" % (port, url), method="PUT")
-    with urllib.request.urlopen(req, timeout=5) as r:
+    with urlopen_local("http://127.0.0.1:%d/json/new?%s" % (port, url),
+                       timeout=5, method="PUT") as r:
         d = json.load(r)
     return {"action": "created", "url": d.get("url")}
 

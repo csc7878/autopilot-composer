@@ -185,6 +185,10 @@ def actions_to_taskflow(actions, repo=None):
     steps = []
     for a in actions:
         step = {"type": a.type, "func": a.func, "args": list(a.params)}
+        if a.ts:
+            # v3.6.0：录制时间戳，供 verify 自动推断按时间对齐原始事件；
+            # 回放器不认识该字段，会安全忽略。
+            step["ts"] = a.ts
         if a.element_ref:
             step["element_ref"] = a.element_ref
         if a.app:

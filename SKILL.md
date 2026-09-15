@@ -2,7 +2,7 @@
 name: AutoPilot Composer
 displayName: AutoPilot Composer
 slug: autopilot-composer
-version: 3.5.0
+version: 3.6.0
 runtime: python
 tags:
   - automation
@@ -29,7 +29,11 @@ tags:
   - env-guard
   - step-stats
   - checkpoint-rollback
-description: 桌面 GUI（pyautogui）+ 浏览器 CDP 双引擎 RPA，支持「录制→元素库→回放」原子动作建模、复用组件库、操作日志审计与流程挖掘、断点续跑与自动重试。v3.4.0 新增 T1 直连层（CLI/API/SQL），录制时自动捕获 UI 背后的 API 请求，回放时优先直调 API/CLI/SQL，失败自动降级到 GUI。v3.4.1 新增步骤级结果校验（verify，不再「点完就算成功」）与元素库健康度自愈。v3.5.0 新增置信度驱动的自适应执行：给每步打 0~5 分把握分（零模型，纯确定性信号合成），低置信时主动请求人工确认而不是盲目执行；识别登录页过期/错误页/意外弹窗等环境陷阱并尝试自愈；重试不再原样重跑而是自适应轮换策略。对标影刀/UiPath 的企业级自动化能力。
+  - auto-verify
+  - verify-candidates
+  - record-time-assertions
+  - proxy-bypass
+description: 桌面 GUI（pyautogui）+ 浏览器 CDP 双引擎 RPA，支持「录制→元素库→回放」原子动作建模、复用组件库、操作日志审计与流程挖掘、断点续跑与自动重试。v3.4.0 新增 T1 直连层（CLI/API/SQL），录制时自动捕获 UI 背后的 API 请求，回放时优先直调 API/CLI/SQL，失败自动降级到 GUI。v3.4.1 新增步骤级结果校验（verify，不再「点完就算成功」）与元素库健康度自愈。v3.5.0 新增置信度驱动的自适应执行：给每步打 0~5 分把握分（零模型，纯确定性信号合成），低置信时主动请求人工确认而不是盲目执行；识别登录页过期/错误页/意外弹窗等环境陷阱并尝试自愈；重试不再原样重跑而是自适应轮换策略。v3.6.0 新增录制时自动生成校验候选：录制过程顺手记下「这一步让页面发生了什么变化」（URL 跳转、录入值回读、反馈文案、弹窗、加载结束、窗口焦点），据此自动写出 verify 规格，免去手写；只断言录制时真实观测到的事实，易变文案与密码类字段一律不碰。对标影刀/UiPath 的企业级自动化能力。
 entry: ./scripts/main_task.py
 trigger:
   - 启动长任务自动化
@@ -254,6 +258,7 @@ python recorder.py --out my_flow.json --js my_flow.js
   - 进入录制时的首页面 → `open_url`；
   - 由点击 / 按键触发的跳转 → **自动去重**（播放时 `click_elem` / `key_press` 本身就会导航，不再重复 `open_url`）。
 - **跨域 iframe**：录制脚本通过 `Page.addScriptToEvaluateOnNewDocument` 注入到所有 frame（含跨域），iframe 内的点击 / 输入 / 拖拽同样会被捕获（选择器相对于该 frame 文档）。
+- **结果校验（v3.6.0，默认开启）**：录制的同时顺手记下「这一步让页面发生了什么变化」，自动写出 `verify` 规格（URL 跳转 / 录入值回读 / 反馈文案 …），并生成 `verify_candidates.md` 供复核。用 `--verify off` 关闭、`--verify all` 放开中置信项，详见 §8.7。
 
 ### 6.5.4 复用与修订
 
@@ -270,6 +275,7 @@ cd scripts
 .venv\Scripts\activate
 python desktop_recorder.py            # 回车开始，操作各类软件，回车停止
 python desktop_recorder.py --out desktop_flow.json --py recorded_desktop.py
+python desktop_recorder.py --verify all    # v3.6.0：自动生成窗口标题校验（默认 all）
 ```
 
 导出两份：
@@ -291,14 +297,16 @@ cd scripts
 python record_session.py                  # 网页+桌面同时录
 python record_session.py --desktop-only   # 只录桌面
 python record_session.py --web-only      # 只录网页
+python record_session.py --verify auto   # v3.6.0：自动生成校验（默认 auto）
 ```
 
 导出：
 
-- `task_flow.json` —— **统一流程**（browser / gui 混排，按时间排序），`main_task.py` 直接播放。
+- `task_flow.json` —— **统一流程**（browser / gui 混排，按时间排序，含自动生成的 `verify`），`main_task.py` 直接播放。
 - `recorded_flow.js` —— 网页部分独立 Playwright 脚本。
 - `recorded_desktop.py` —— 桌面部分独立 pyautogui 脚本。
-- `SOP.md` —— 人读版操作手册，每步标注所属应用（如【企业微信】【WPS 文字】【网页】）。
+- `SOP.md` —— 人读版操作手册，每步标注所属应用（如【企业微信】【WPS 文字】【网页】），带校验的步骤会追加「〔校验：…〕」。
+- `verify_candidates.md` —— 自动生成的校验候选报告（v3.6.0，`--verify off` 时不产出）。
 
 这样你就拥有了一条从「手动操作」到「可复用 SOP」的完整链路：录一次 → 导出 → 反复播放 / 改参数 / 加分支，持续修订。
 
@@ -449,6 +457,64 @@ python main_task.py --health   # 元素库体检 + 步骤战绩（哪几步最�
 完整教程（信号详解、模式选择建议、配置参考、现场输出解读、学术溯源对照表）见
 `docs/confidence-and-intervention.md`。
 
+## 8.7 录制时自动生成校验候选（v3.6.0 新增）
+
+**解决的问题**：v3.4.1 有了步骤级校验，但规格要人手写。实测「录 60 步能正确手写
+出校验的不到 10 步」——因为手写要求你回答「点完这个按钮页面变成了什么样」，而这件
+事**录制的那一刻最容易知道、事后最想不起来**。于是让录制器在录的时候顺手记下变化，
+自动写成 `verify`。
+
+用法（默认就开着）：
+
+```bash
+python recorder.py --verify auto          # 网页录制
+python record_session.py --verify auto    # 网页 + 桌面合并录制
+python desktop_recorder.py --verify all   # 只录桌面
+```
+
+| 参数 | 说明 |
+|------|------|
+| `--verify off` | 不生成，等同 v3.5.0 行为 |
+| `--verify auto` | **默认**。只生成高置信校验 |
+| `--verify all` | 额外生成弹窗 / 加载遮罩 / 窗口标题 / 值被规范化等中置信校验 |
+| `--verify-report <路径>` | 报告输出位置，默认 `verify_candidates.md` |
+
+**六条推断规则**（全部只断言录制时真实观测到的事实，不推测）：
+
+| 规则 | 观测到什么 | 生成什么 | 置信 |
+|------|-----------|---------|------|
+| URL 变化 | 动作前后 URL 路径变了 | `url_contains`（锚定新增段，剥掉 ID） | 高 |
+| 录入回读 | 回读值 == 录入文本 | `element_value_equals` | 高 |
+| 录入回读 | 回读值包含录入文本 | `element_value_contains` | 高 |
+| 反馈文案 | 动作后出现、动作前没有的提示 | `text_present` | 高 |
+| 录入回读 | 页面把值规范化了 / 没探测数据 | 按观测值或录入文本断言 | 中 |
+| 弹窗出现 | 动作后新出现对话框 | `element_exists` | 中 |
+| 加载结束 | 动作前在加载、之后结束 | `element_absent` | 中 |
+| 窗口焦点 | 桌面动作附近有焦点事件 | `window_title` | 中 |
+
+**两条硬过滤**：
+
+1. **易变文案丢弃** —— 含数字/日期/金额的提示（「订单 12345 已保存」）第二次跑必然
+   不同，一律不生成（这是自动校验最常见的误报来源），并在报告里写明原因。
+2. **敏感字段不碰** —— 密码框、验证码、身份证/卡号类输入**永不回读**，避免凭证写进
+   `task_flow.json`。
+
+**录制后多出一个 `verify_candidates.md`**，逐条列出：写入了什么、什么置信级别、
+**依据是什么**，以及**跳过了什么、为什么跳过**。不想静默省略是本功能的态度。
+
+```bash
+# 真机自检（需要你自己先用调试模式开 Chrome）
+python check_probe_live.py
+```
+
+完整说明（规则细节、模式选择、报告解读、复核与改写、已知边界）见
+`docs/recorder-verify-candidates.md`。
+
+> **顺带修复**：真机排查时发现本机 `HTTP_PROXY` 存在时，Python `urllib` 会把
+> `127.0.0.1:9222` 的回环请求也送进代理并返回 **502 Bad Gateway**，表现为「Chrome
+> 明明开着却连不上」。v3.6.0 新增 `core/local_http.py`，凡对回环地址的请求一律绕过
+> 代理（5 处调用点已替换）。注意 T1 直连层调**远程**业务接口时**不**绕过代理。
+
 ## 9. 配置项 `config.json`
 
 ```json
@@ -549,6 +615,36 @@ AutoPilot Composer 已改用 **page 级 WebSocket 通道**（通过 `http://127.
 
 保留 `breakpoint.json` 即可断点续跑；想重置则删除该文件或把 `current_step` 改为 0。
 
+### 11.6 连不上调试端口，报 502 Bad Gateway（v3.6.0 修复）
+
+**症状**：Chrome 明明用 `--remote-debugging-port=9222` 开着，程序却报
+`HTTP Error 502: Bad Gateway`（而不是「连接被拒」），或者录制器说「未找到可连接的
+浏览器标签页」。
+
+**根因**：本机存在 `HTTP_PROXY` / `HTTPS_PROXY`（Clash 之类的本地代理、公司网关、
+某些开发工具注入的环境变量）时，Python `urllib` **会把 `127.0.0.1` 的回环请求也送进
+代理**，代理找不到目标就返回 502。报错是 502 而不是 ECONNREFUSED，所以很容易误判
+成「Chrome 没启动」。
+
+**自检**：
+
+```bash
+cd scripts
+python -c "import os,urllib.request; print(os.environ.get('HTTP_PROXY'), urllib.request.getproxies())"
+```
+
+**v3.6.0 起已修复**：`core/local_http.py` 对回环地址显式禁用代理，5 处调用点
+（`cdp_engine` / `recorder` / `browser_launcher`×2 / `chat_mode`）已替换。
+若你在旧版本遇到此问题，临时办法是运行前清掉环境变量：
+
+```bash
+set HTTP_PROXY=
+set HTTPS_PROXY=
+```
+
+> 注意：只对**本机**地址绕过代理。T1 直连层调用远程业务接口（金蝶/用友等）时仍走
+> 用户配置的网络环境，不受影响。
+
 ## 12. 本地真实示例（已验证）
 
 项目提供了一个本地 demo 页和对应流程，用于验证真实 Chrome 环境：
@@ -618,39 +714,60 @@ python scripts/chat_mode.py "回放"                          # 回放最近一�
 
 ## 16. 目录结构
 
-autopilot-composer-3.5.0/
+autopilot-composer-3.6.0/
 ├── SKILL.md                 # 本文档
 ├── docs/
 │   ├── t1-direct-layer.md   # T1 直连层使用指南（API 模板/凭证管理/SQL 安全/Tier 降级）
 │   ├── verify-and-health.md # 结果校验 + 元素库健康度指南（配方与排错）
-│   └── confidence-and-intervention.md # 置信度驱动的自适应执行（信号/模式/环境守卫/回滚/学术溯源）
+│   ├── confidence-and-intervention.md # 置信度驱动的自适应执行（信号/模式/环境守卫/回滚/学术溯源）
+│   └── recorder-verify-candidates.md  # 录制时自动生成校验候选（规则/分级/报告/复核/边界）
 ├── 小白使用说明.md           # 零基础快速上手手册
 ├── scripts/
 │   ├── main_task.py         # 任务编排入口（T1 优先 + 结果校验 + 置信度评分 + 自适应介入 + --health/--reset）
 │   ├── cdp_engine.py        # 浏览器 CDP 引擎（多策略定位 / 定位器健康度记账 / 校验探针 / avoid 策略轮换）
 │   ├── gui_engine.py        # 桌面 GUI 引擎（播放端）
-│   ├── recorder.py          # 网页录制器 v2（导出 task_flow + 元素库 + Playwright）+ InteractiveRecorder 实时确认
+│   ├── recorder.py          # 网页录制器 v2（导出 task_flow + 元素库 + Playwright）+ 动作后探测 + InteractiveRecorder 实时确认
 │   ├── browser_launcher.py  # 自带浏览器启动器（一键拉起 Chrome 调试实例）
 │   ├── confirm_box.py       # 系统 GUI 弹窗（录制逐步确认 + 回放自适应介入 ask_choice）
 │   ├── chat_mode.py         # 对话驱动入口（自然语言意图分发）
 │   ├── preset_elements.json # 预置元素库（常见站点多策略定位器）
-│   ├── desktop_recorder.py  # 桌面应用录制器
-│   ├── record_session.py    # 合并录制会话
+│   ├── desktop_recorder.py  # 桌面应用录制器（窗口标题校验推断）
+│   ├── record_session.py    # 合并录制会话（网页 + 桌面，统一挂载校验）
+│   ├── probe_demo.html      # 探测自检页（真机验证用：输入 + 点保存弹提示）
+│   ├── check_probe_live.py  # 真机自检：在真实 Chrome 里验证探测是否正常工作
+│   ├── recorder_probe_js_test.js      # 注入脚本的 node 单测（DOM 桩 + 合成事件）
 │   ├── e2e_v341_test.py     # v3.4.1 离线验证（结果校验 + 元素库健康度，33 项断言，免浏览器）
 │   ├── e2e_v350_test.py     # v3.5.0 离线验证（置信度/环境守卫/战绩/检查点/主循环，73 项断言）
+│   ├── e2e_v360_test.py     # v3.6.0 离线验证（校验推断 6 规则 + 接线 + 端到端 + 代理绕过，122 项断言）
+│   ├── e2e_v360_js_test.py  # v3.6.0 JS 层验证入口（调 node 真实执行注入脚本，47 项断言）
 │   ├── config.json / breakpoint.json / task_flow.json
 │   ├── core/                # 核心模块（actions / locator / observer / op_log / components / element_repo
 │   │                        #   + T1 直连层：api_client / api_registry / cli_executor / cli_registry /
 │   │                        #     db_client / db_registry / db_security / credential_manager /
 │   │                        #     network_capture / tier_resolver
 │   │                        #   + 可靠性层：verify（结果校验）/ confidence（置信度评分）/
-│   │                        #     env_guard（环境守卫）/ step_stats（步骤战绩）/ checkpoint（检查点回滚））
+│   │                        #     env_guard（环境守卫）/ step_stats（步骤战绩）/ checkpoint（检查点回滚）
+│   │                        #   + v3.6.0：verify_advisor（录制时推断校验候选）/
+│   │                        #     local_http（本机回环请求绕过系统代理））
 │   └── requirements.txt
 
 
 ```
 
 ## 17. 版本记录
+
+- **3.6.0**（录制时自动生成校验候选 + 本机回环请求绕过代理）——起点是一个很具体的痛点：v3.4.1 有了步骤级校验，但**规格要手写**，实测「录 60 步能正确手写出校验的不到 10 步」，因为手写要求你回答「点完这个按钮页面变成了什么样」，而这恰恰是录制那一刻最容易知道、事后最想不起来的信息。录制器本来就知道答案，于是让它顺手写下来：
+  1. `core/verify_advisor.py` 校验推断器（纯 Python、可离线测试）：从「动作事件 + 动作后探测」推断 `verify` 候选，六条规则 —— **URL 变化**（锚定新增路径段并剥掉 ID/时间戳，仅查询串变化不生成）、**录入回读**（回读值一致 → `element_value_equals`；包含 → `element_value_contains`；被页面规范化 → 按观测值断言）、**反馈文案**（动作后出现且动作前不存在的提示 → `text_present`）、**弹窗出现**（→ `element_exists`）、**加载结束**（→ `element_absent`，顺带等异步渲染）、**窗口焦点**（桌面动作 → `window_title`，用于确认没点错窗口）。
+  2. **设计红线：只断言录制时真实观测到的事实，不做任何推测。** 一个误报的校验比没有校验更糟 —— 它会把本来成功的流程打断（重试 → 降级 → 失败 → 停断点），用户看到的是「昨天还好好的，今天第一步就挂了」。所以宁少勿错：URL 没变就不写 URL 校验；没回读到值就降为中置信（默认不写）；没有「动作前快照」的老产物直接放弃反馈类规则。每条候选带 `level`（high/medium）、`rule`、`why`，报告里逐条列依据。
+  3. **三档模式**：`--verify off`（等同 v3.5.0，完全不生成）/ `auto`（**默认**，只写高置信）/ `all`（含弹窗、加载遮罩、窗口标题、值被规范化等中置信）。步骤上已有手工 `verify` 时默认**保留不动**（录制实时挂载路径才用 `force`）。
+  4. **两条硬过滤**：① 易变文案丢弃 —— 含数字/日期/金额的提示（「订单 12345 已保存」）第二次跑必然不同，一律不生成（自动校验最常见的误报来源），并在报告写明原因；② 敏感字段不回读 —— 密码框、验证码、身份证/卡号类输入（选择器名或 11 位以上纯数字值）永不生成值校验，避免凭证写进流程文件。
+  5. **动作后探测**（`recorder.py` 注入脚本）：动作事件附带「动作前快照」（反馈容器 / 弹窗 / 加载遮罩），并在 +0.7s / +1.8s 各探测一次「动作后状态」，含被操作元素的回读值与是否仍存在；探测按 `for_ts` 回指源动作，`probe` 事件不进流程、不触发确认弹窗。开销受控：固定容器 + 可见性判断 + 每选择器 40 节点扫描上限（低配机器上不做整页 DOM 差分）。
+  6. **接线**：`recorder.py`（含 `InteractiveRecorder` 实时挂载）、`record_session.py`（网页 + 桌面合并，网页走 URL/反馈/回读，桌面走窗口标题，并回写 `Action.verify` 让 SOP 里也显示校验）、`desktop_recorder.py`。步骤与 `Action` 新增 `ts` 字段用于按时间对齐（回放器安全忽略；`_find_step_ts` 优先读它，顺带让 T1 `t1_ref` 关联更精确）。
+  7. **人读报告** `verify_candidates.md`：本次结果 / 已写入的校验（含依据）/ **跳过的地方及原因** / 复核建议。「不做的事也说明原因」是本功能的态度。
+  8. **顺带修复（真机排查发现）**：本机存在 `HTTP_PROXY` 时，Python `urllib` 会把 `127.0.0.1:9222` 的回环请求也送进代理并返回 **502 Bad Gateway**，表现为「Chrome 明明开着调试端口却连不上」，且报错是 502 而非连接被拒，极难排查。新增 `core/local_http.py`（`urlopen_local`，显式空 `ProxyHandler`），替换 5 处调用点（`cdp_engine` / `recorder` / `browser_launcher`×2 / `chat_mode`）。**T1 直连层调远程业务接口时不绕过代理** —— 隔离在该模块就是为了划清这条界线。
+  9. 顺带修：`events_to_taskflow` 遇到只有坐标的桌面事件（缺 `selector`）会 `KeyError`，现改为跳过，使转换器对混合事件流健壮；`url_after` 在步骤缺 `ts` 时不再因 `int <= None` 抛 TypeError。
+  10. **验证**：新增 `scripts/e2e_v360_test.py`（**122 项断言**：文本/URL 工具、6 条规则、模式与挂载、录制器接线、端到端、以及「真起本地 HTTP 服务 + 假代理」的功能级代理绕过验证）与 `scripts/e2e_v360_js_test.py`（**47 项断言**，用 DOM 桩 + 合成事件 + 确定性定时器**真实执行**注入的探测脚本 —— 这是本次风险最高的一段代码，跑在真实网页 JS 上下文里，抛错会被静默吞掉）。回归：v3.5.0 的 73 项、v3.4.1 的 33 项全过，合计 **275 项断言**，全部免浏览器免 GPU。另新增 `scripts/check_probe_live.py` + `probe_demo.html` 供在有调试 Chrome 的机器上做真机自检。文档：新增 `docs/recorder-verify-candidates.md`，SKILL.md 新增 §8.7，小白手册升级 v3.6.0。
+  11. **已知边界**：跨页跳转后拿不到探测（JS 上下文被销毁，但 `navigate` 事件仍能推断 URL 类校验）；自研 UI 框架的反馈容器可能扫不到；桌面侧只有窗口标题一种校验（不校验截图，本机跑不了视觉模型是硬约束）；探测时间点固定在 0.7s/1.8s，更慢出现的提示抓不到。
 
 - **3.5.0**（置信度驱动的自适应执行）——借鉴 OS-Kairos（ACL 2025 Findings, arXiv:2503.16465）的「自适应人机协作」机制，移植为**零模型的确定性版本**（本机 2 核 Pentium / 8GB / 核显无法运行 VLM）：
   1. `core/confidence.py` 置信度评分器：用 8 类确定性信号（Tier 层级 / 定位唯一性 / 定位策略秩 / 元素健康度 / 步骤历史成功率 / 是否配 verify / 环境状态）合成 0~5 分，每一分都能追溯到具体信号；三档动作（自动 / 确认 / 中止）+ 三种模式（`off` / `shadow` 默认只看不拦 / `adaptive` 该问就问）。

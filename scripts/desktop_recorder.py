@@ -33,6 +33,12 @@ try:
 except Exception:
     HAS_PYNPUT = False
 
+# 录制时自动推断 verify 候选（v3.6.0）。桌面侧只用到窗口标题规则，纯函数、无额外依赖。
+try:
+    from core.verify_advisor import VerifyAdvisor
+except ImportError:
+    VerifyAdvisor = None
+
 # 已知应用 exe -> 中文名（按需增补）
 APP_MAP = {
     "WXWork.exe": "企业微信",
@@ -287,10 +293,15 @@ class DesktopRecorder:
 # 事件 → 可复用脚本 的转换
 # ---------------------------------------------------------------------------
 def events_to_gui_taskflow(events):
-    """导出 AutoPilot Composer 原生 gui 流程步骤。"""
+    """导出 AutoPilot Composer 原生 gui 流程步骤。
+
+    v3.6.0：每步附 ts（录制时间戳），供 verify 自动推断按时间对齐焦点事件；
+    回放器不认识该字段，会安全忽略。
+    """
     steps = []
     for ev in events:
         t = ev.get("type")
+        before = len(steps)
         if t == "focus":
             steps.append({"type": "gui", "func": "open_software", "args": [ev.get("exe", "")]})
         elif t == "click":
@@ -310,6 +321,8 @@ def events_to_gui_taskflow(events):
                 steps.append({"type": "gui", "func": "input_text", "args": [ev["text"]]})
             elif ev.get("keys"):
                 steps.append({"type": "gui", "func": "press_keys", "args": [ev["keys"]]})
+        if len(steps) > before and ev.get("ts"):
+            steps[-1]["ts"] = ev["ts"]
     return steps
 
 
@@ -382,6 +395,11 @@ def main():
     ap = argparse.ArgumentParser(description="AutoPilot Composer 桌面录制器")
     ap.add_argument("--out", default="desktop_flow.json", help="导出的 gui task_flow.json")
     ap.add_argument("--py", default="recorded_desktop.py", help="导出的独立 pyautogui 脚本")
+    ap.add_argument("--verify", choices=("off", "auto", "all"), default="all",
+                    help="自动生成步骤结果校验：桌面侧只能推断窗口标题类校验，"
+                         "属于中置信，故默认 all；off 表示不生成")
+    ap.add_argument("--verify-report", default="verify_candidates.md",
+                    help="校验候选人读报告的输出路径（--verify off 时不写）")
     args = ap.parse_args()
 
     rec = DesktopRecorder()
@@ -397,6 +415,18 @@ def main():
         return
 
     tf = events_to_gui_taskflow(events)
+
+    # v3.6.0：桌面侧自动生成窗口标题校验（确认没有点错窗口）
+    verify_adv = None
+    if VerifyAdvisor is not None and args.verify != "off":
+        verify_adv = VerifyAdvisor(mode=args.verify)
+        verify_adv.attach(tf, events)
+        try:
+            with open(args.verify_report, "w", encoding="utf-8") as f:
+                f.write(verify_adv.render_report(args.out) + "\n")
+        except Exception as e:
+            print("   ⚠️ 校验报告写入失败：%s" % e)
+
     py_lines = events_to_pyautogui(events)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(tf, f, ensure_ascii=False, indent=2)
@@ -405,6 +435,10 @@ def main():
     print("✅ 已录制 %d 个桌面动作，导出两份文件：" % len(events))
     print("   - %s  （%d 步，gui 类型，可并入主流程播放）" % (args.out, len(tf)))
     print("   - %s  （python 直接运行）" % args.py)
+    if verify_adv is not None:
+        print("   - %s  （自动生成校验：%d 步已写入 / 共推断 %d 条候选）"
+              % (args.verify_report, verify_adv.report.get("applied", 0),
+                 verify_adv.report.get("candidates", 0)))
 
 
 if __name__ == "__main__":

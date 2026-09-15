@@ -53,6 +53,18 @@ try:
 except ImportError:
     _HAS_CORE = False
 
+# 录制时自动推断 verify 候选（v3.6.0）
+try:
+    from core.verify_advisor import VerifyAdvisor
+except ImportError:
+    VerifyAdvisor = None
+
+# 访问本机调试端口时绕过系统代理（详见 core/local_http.py）
+try:
+    from core.local_http import urlopen_local as _urlopen_local
+except ImportError:
+    _urlopen_local = urllib.request.urlopen
+
 
 # ---------------------------------------------------------------------------
 # 注入到网页里的录制脚本（监听用户操作，通过 CDP binding 回传）
@@ -144,11 +156,116 @@ RECORDER_JS = r"""
     return 'body > ' + parts.join(' > ');
   }
 
-  function emit(obj) {
+  function emit(obj, el) {
     obj.url = location.href;
     obj.ts = Date.now();
     obj.frame = (window !== window.top) ? location.href : null;
+    // v3.6.0：动作类事件带「动作前快照」并安排动作后探测，供自动生成校验用
+    if (PROBE_TYPES[obj.type]) {
+      try { obj.pre = snapshot(); } catch (e) { /* ignore */ }
+      try { scheduleProbe(obj, el); } catch (e) { /* ignore */ }
+    }
     try { apcRecord(JSON.stringify(obj)); } catch (e) { /* ignore */ }
+  }
+
+  // -------- 动作后探测（v3.6.0）--------
+  // 目的：让录制器顺手记下「这个动作让页面发生了什么变化」，于是校验规格可以
+  // 自动生成，而不必事后靠回忆手写。
+  // 只采集语义明确的几类信号（反馈文案 / 弹窗 / 加载遮罩 / 被操作元素回读值），
+  // 不做整页 DOM 差分——低配机器上全量差分开销不可接受。
+  var FEEDBACK_SEL = [
+    '[role="alert"]', '[role="status"]',
+    '.el-message', '.el-notification', '.el-message__content',
+    '.ant-message-notice-content', '.ant-notification-notice-message', '.ant-alert-message',
+    '.layui-layer-msg', '.layui-layer-content',
+    '.toast', '.toast-message', '.van-toast', '.van-notify',
+    '.alert-success', '.alert-danger', '.alert-warning',
+    '[class*="message-text"]', '[class*="toast-text"]', '[class*="notice-text"]'
+  ];
+  var DIALOG_SEL = [
+    '[role="dialog"]', '[aria-modal="true"]',
+    '.el-dialog', '.ant-modal-content', '.layui-layer-page',
+    '.modal.show', '.MuiDialog-root', '.van-dialog'
+  ];
+  var LOADING_SEL = [
+    '.loading', '.loading-mask', '.el-loading-mask', '.el-loading-spinner',
+    '.ant-spin-spinning', '.van-loading', '.spinner', '[aria-busy="true"]'
+  ];
+  var PROBE_TYPES = { click: 1, change: 1, upload: 1, keys: 1, drag: 1 };
+  var PROBE_DELAYS = [700, 1800];   // 两次探测：抓瞬时 toast，也抓稍慢的渲染
+  var MAX_SCAN = 40;                // 每个选择器最多看 40 个节点，防止重页面卡顿
+  var pendingProbes = {};
+
+  function _visible(el) {
+    try {
+      var st = getComputedStyle(el);
+      if (!st || st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') {
+        return false;
+      }
+      var r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    } catch (e) { return false; }
+  }
+
+  function _collect(selectors, max, needText) {
+    var out = [], seen = {};
+    for (var i = 0; i < selectors.length; i++) {
+      var nodes;
+      try { nodes = document.querySelectorAll(selectors[i]); } catch (e) { continue; }
+      for (var j = 0; j < nodes.length && j < MAX_SCAN; j++) {
+        if (out.length >= max) return out;
+        var el = nodes[j];
+        if (!_visible(el)) continue;
+        var txt = '';
+        try { txt = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim(); }
+        catch (e) { txt = ''; }
+        if (needText && !txt) continue;
+        var sel = bestSelector(el);
+        var key = sel + '|' + txt.slice(0, 40);
+        if (seen[key]) continue;
+        seen[key] = 1;
+        out.push({ selector: sel, text: txt.slice(0, 60) });
+      }
+    }
+    return out;
+  }
+
+  function snapshot() {
+    return {
+      feedback: _collect(FEEDBACK_SEL, 6, true),
+      dialogs: _collect(DIALOG_SEL, 3, false),
+      loading: _collect(LOADING_SEL, 3, false)
+    };
+  }
+
+  function scheduleProbe(obj, el) {
+    var ts = obj.ts;
+    if (el) pendingProbes[ts] = el;
+    for (var i = 0; i < PROBE_DELAYS.length; i++) {
+      (function (d) {
+        setTimeout(function () { doProbe(ts, d); }, d);
+      })(PROBE_DELAYS[i]);
+    }
+  }
+
+  function doProbe(ts, delay) {
+    var pend = pendingProbes[ts];
+    var out = {
+      type: 'probe', for_ts: ts, delay: delay, ts: Date.now(),
+      url: location.href, title: document.title,
+      frame: (window !== window.top) ? location.href : null
+    };
+    try { out.post = snapshot(); } catch (e) { out.post = null; }
+    try {
+      if (pend) {
+        out.acted_exists = (pend.isConnected === undefined)
+          ? document.contains(pend) : pend.isConnected;
+        out.acted_value = (pend.value !== undefined && pend.value !== null)
+          ? String(pend.value) : String(pend.innerText || '');
+      }
+    } catch (e) { /* 页面已销毁该元素 */ }
+    if (delay >= PROBE_DELAYS[PROBE_DELAYS.length - 1]) delete pendingProbes[ts];
+    try { apcRecord(JSON.stringify(out)); } catch (e) { /* ignore */ }
   }
 
   function isSpecial(k) {
@@ -188,7 +305,7 @@ RECORDER_JS = r"""
     if (!downInfo) {
       // mousedown 未捕获（合成事件 / 跨 context 丢失）时，仍兜底记为一次点击，
       // 避免「点了搜索按钮却录不到」——这正是程序化驱动与部分站点常见的丢事件根因。
-      emit(clickPayload(el));
+      emit(clickPayload(el), el);
       return;
     }
     var dx = e.clientX - downInfo.x, dy = e.clientY - downInfo.y;
@@ -200,9 +317,9 @@ RECORDER_JS = r"""
         to_sel: bestSelector(el),
         from_x: downInfo.x, from_y: downInfo.y,
         to_x: e.clientX, to_y: e.clientY
-      });
+      }, downInfo.el);
     } else {
-      emit(clickPayload(el));
+      emit(clickPayload(el), el);
     }
     downInfo = null;
   }
@@ -222,7 +339,7 @@ RECORDER_JS = r"""
       el_id: el.id || '', el_name: el.name || '', el_placeholder: el.placeholder || '',
       el_role: el.getAttribute('role') || '', el_aria_label: el.getAttribute('aria-label') || '',
       el_text: (el.innerText || '').slice(0, 40),
-      tag: el.tagName ? el.tagName.toLowerCase() : '' }); }, 600);
+      tag: el.tagName ? el.tagName.toLowerCase() : '' }, el); }, 600);
   });
 
   // -------- 输入 / 文件上传 --------
@@ -233,12 +350,12 @@ RECORDER_JS = r"""
       for (var i = 0; i < el.files.length; i++) names.push(el.files[i].name);
       emit({ type: 'upload', selector: bestSelector(el), files: names,
              el_id: el.id || '', el_name: el.name || '', el_placeholder: el.placeholder || '',
-             el_role: el.getAttribute('role') || '', el_aria_label: el.getAttribute('aria-label') || '' });
+             el_role: el.getAttribute('role') || '', el_aria_label: el.getAttribute('aria-label') || '' }, el);
     } else if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
       emit({ type: 'change', selector: bestSelector(el), value: el.value,
              el_id: el.id || '', el_name: el.name || '', el_placeholder: el.placeholder || '',
              el_role: el.getAttribute('role') || '', el_aria_label: el.getAttribute('aria-label') || '',
-             el_text: '', tag: el.tagName ? el.tagName.toLowerCase() : '' });
+             el_text: '', tag: el.tagName ? el.tagName.toLowerCase() : '' }, el);
     }
   });
 
@@ -251,10 +368,10 @@ RECORDER_JS = r"""
       if (e.metaKey) mods.push('Meta');
       if (e.altKey) mods.push('Alt');
       if (['Control','Shift','Alt','Meta'].indexOf(e.key) === -1) mods.push(e.key);
-      emit({ type: 'keys', keys: mods });
+      emit({ type: 'keys', keys: mods }, document.activeElement);
       return;
     }
-    if (isSpecial(e.key)) emit({ type: 'keys', keys: [e.key] });
+    if (isSpecial(e.key)) emit({ type: 'keys', keys: [e.key] }, document.activeElement);
   });
 })();
 """
@@ -294,7 +411,8 @@ class WebRecorder:
             return self.ws
         if url_filter is not None:
             self.url_filter = url_filter
-        with urllib.request.urlopen(self.http + "/json", timeout=5) as r:
+        # 绕过系统代理：否则 HTTP_PROXY 会把 127.0.0.1 的 /json 也送进代理并返回 502
+        with _urlopen_local(self.http + "/json", timeout=5) as r:
             targets = json.load(r)
         cand = [t for t in targets
                 if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
@@ -485,11 +603,22 @@ def events_to_taskflow(events, observer=None):
     若传入 observer（ElementRepository + 解析规则），则步骤会携带 element_ref，
     回放时走「元素库多策略定位」而非脆弱的原始 selector；否则保留旧行为（直接用
     录制时捕获的 selector）以兼容已有产物。
+
+    v3.6.0：每一步附 ts（录制时间戳），供 verify 自动推断按时间对齐原始事件；
+    回放器不认识该字段，会安全忽略。
     """
     steps = []
     _dedupe_navigate(events)
     for ev in events:
         t = ev.get("type")
+        if t == "probe":
+            continue                      # 探测事件不是动作，不进流程
+        # 防御：桌面事件（只有 x/y）若被误合并进网页事件流，不应直接崩；
+        # 它们缺少 selector，交给 desktop_recorder 转换。
+        if t in ("click", "change", "hover", "upload", "drag") and not ev.get("selector") \
+                and not ev.get("from_sel"):
+            continue
+        before = len(steps)
         if t == "navigate":
             if not ev.get("_redundant"):
                 steps.append({"type": "browser", "func": "open_url", "args": [ev["url"]]})
@@ -516,6 +645,8 @@ def events_to_taskflow(events, observer=None):
                     "args": [ev["selector"], ev.get("files", [])]}
             _maybe_attach_ref(observer, ev, step)
             steps.append(step)
+        if len(steps) > before and ev.get("ts"):
+            steps[-1]["ts"] = ev["ts"]
     return steps
 
 
@@ -593,11 +724,14 @@ class InteractiveRecorder:
       rec.run_loop()          # 阻塞，直到用户主动停止（Ctrl-C）或达到 max_steps
     """
 
-    def __init__(self, port=9222, confirm=True, confirm_timeout=8, max_steps=None):
+    def __init__(self, port=9222, confirm=True, confirm_timeout=8, max_steps=None,
+                 verify="auto", verify_report=None):
         self.port = port
         self.confirm = confirm
         self.confirm_timeout = confirm_timeout
         self.max_steps = max_steps
+        self.verify_mode = verify
+        self.verify_report = verify_report
         self.rec = WebRecorder(port=port)
         self.home = os.path.dirname(os.path.abspath(__file__))
         self.workdir = None          # recordings/<host>/
@@ -606,6 +740,11 @@ class InteractiveRecorder:
         self.observer = None
         self.task_flow = []          # 已确认的步骤
         self._stop = False
+        # v3.6.0：实时挂载 verify 用——原始事件流 + 时间戳→步骤下标
+        self.raw_events = []
+        self._ts_index = {}
+        self.advisor = (VerifyAdvisor(mode=verify)
+                        if (VerifyAdvisor is not None and verify != "off") else None)
 
     def prepare(self, first_url=None):
         """连接浏览器、注入录制脚本，并建立归档目录与元素库。"""
@@ -642,8 +781,25 @@ class InteractiveRecorder:
             pass
         self.rec.stop()
         self._save()
+        self._write_verify_report()
         print("✅ 录制结束，已记录 %d 步。产物目录：%s" % (len(self.task_flow), self.workdir))
         return self.workdir
+
+    def _write_verify_report(self):
+        """写出校验候选报告（v3.6.0）。"""
+        if self.advisor is None or self.workdir is None:
+            return
+        path = self.verify_report or os.path.join(self.workdir, "verify_candidates.md")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.advisor.render_report(
+                    os.path.join(self.workdir, "task_flow.json")) + "\n")
+            rep = self.advisor.report or {}
+            print("🔎 自动生成校验：%d 步已写入 / 共推断 %d 条候选（模式 %s）→ %s"
+                  % (rep.get("applied", 0), rep.get("candidates", 0),
+                     self.verify_mode, os.path.basename(path)))
+        except Exception as e:
+            print("   ⚠️ 校验报告写入失败：%s" % e)
 
     def _wait_one_event(self, timeout=0.5):
         """从录制器缓冲里取一条事件（带轮询）。"""
@@ -656,14 +812,24 @@ class InteractiveRecorder:
 
     def _handle_event(self, ev):
         t = ev.get("type")
+        self.raw_events.append(ev)
+
+        # v3.6.0：探测事件不是动作——不弹确认、不进流程，只用来给上一步补校验
+        if t == "probe":
+            self._attach_verify(ev.get("for_ts"))
+            return
+
         # 过滤冗余导航
         if t == "navigate" and not ev.get("initial"):
             # 若紧跟在点击/按键后，视为冗余，跳过
             pass
         if t == "navigate" and ev.get("initial"):
             # 首屏导航：直接记录为 open_url（不弹窗，必记）
-            step = {"type": "browser", "func": "open_url", "args": [ev["url"]]}
+            step = {"type": "browser", "func": "open_url", "args": [ev["url"]],
+                    "ts": ev.get("ts")}
             self.task_flow.append(step)
+            if ev.get("ts"):
+                self._ts_index[ev["ts"]] = len(self.task_flow) - 1
             self._save()
             print("  📍 已自动记录导航:", ev["url"])
             return
@@ -678,7 +844,7 @@ class InteractiveRecorder:
             print("  ⏭️  跳过:", _brief(ev))
             return
 
-        step = {"type": "browser"}
+        step = {"type": "browser", "ts": ev.get("ts")}
         if t == "click":
             step.update({"func": "click_elem", "args": [ev["selector"]]})
             self._attach(ev, step)
@@ -699,8 +865,32 @@ class InteractiveRecorder:
             return
 
         self.task_flow.append(step)
+        if ev.get("ts"):
+            self._ts_index[ev["ts"]] = len(self.task_flow) - 1
         self._save()
         print("  ✓ 已记录:", _brief(ev))
+
+    def _attach_verify(self, for_ts):
+        """给刚记录的那一步挂上自动推断的校验（v3.6.0，实时）。
+
+        探测是异步到货的（+0.7s / +1.8s 各一次），所以每来一条就重跑一次推断；
+        后面到的探测往往能补齐更晚才出现的信号（例如稍慢弹出的提示文案）。
+        """
+        if self.advisor is None or not for_ts:
+            return
+        idx = self._ts_index.get(for_ts)
+        if idx is None or idx >= len(self.task_flow):
+            return
+        step = self.task_flow[idx]
+        if step.get("func") == "open_url":
+            return
+        try:
+            self.advisor.attach([step], self.raw_events, force=True)
+        except Exception:
+            return
+        if step.get("verify"):
+            self._save()
+            print("    🔎 已为该步生成校验:", _brief_verify(step.get("verify")))
 
     def _attach(self, ev, step):
         if self.observer:
@@ -745,7 +935,33 @@ def _brief(ev):
         return "按键 %s" % ("+".join(ev.get("keys", [])))
     if t == "upload":
         return "上传 %s" % ", ".join(ev.get("files", []))
+    if t == "probe":
+        return "探测（动作后状态）"
     return str(t)
+
+
+def _brief_verify(spec):
+    """把 verify 规格缩成一句话（录制现场打印用）。"""
+    items = spec if isinstance(spec, (list, tuple)) else ([spec] if spec else [])
+    parts = []
+    for s in items:
+        if not isinstance(s, dict):
+            continue
+        t = s.get("type", "")
+        if t in ("text_present", "text_absent"):
+            parts.append("含文本「%s」" % s.get("text", ""))
+        elif t == "url_contains":
+            parts.append("URL 含 %s" % s.get("value", ""))
+        elif t == "window_title":
+            parts.append("窗口标题含「%s」" % s.get("value", ""))
+        elif t in ("element_value_equals", "element_value_contains"):
+            parts.append("%s 值含「%s」" % (s.get("selector", ""), str(s.get("value", ""))[:20]))
+        elif t in ("element_exists", "element_absent"):
+            parts.append("%s %s" % ("出现" if t == "element_exists" else "消失",
+                                    s.get("selector", "")))
+        else:
+            parts.append(t)
+    return "、".join(parts) if parts else ""
 
 
 
@@ -793,7 +1009,13 @@ def _attach_t1_refs(steps, events, api_events, api_registry):
 
 
 def _find_step_ts(step, events):
-    """从步骤反查原始事件时间戳（粗略匹配）。"""
+    """从步骤反查原始事件时间戳。
+
+    v3.6.0：优先读步骤自带的 ts（录制器已写入，精确）；老产物没有 ts 时才回退到
+    按 func + selector 的模糊匹配。
+    """
+    if step.get("ts"):
+        return step["ts"]
     func = step.get("func", "")
     selector = step.get("args", [""])[0] if step.get("args") else ""
     for ev in events:
@@ -821,6 +1043,12 @@ def main():
                     help="自动录制时长（秒），到时自动停止；无 tty / 非交互场景使用")
     ap.add_argument("--stop-file", default=None,
                     help="监控该文件出现即停止录制（无 tty 场景），如 .apc_stop")
+    ap.add_argument("--verify", choices=("off", "auto", "all"), default="auto",
+                    help="自动生成步骤结果校验（verify）："
+                         "off 不生成；auto（默认）只生成录制时直接观测到的高置信校验；"
+                         "all 额外生成弹窗/加载/窗口标题类中置信校验")
+    ap.add_argument("--verify-report", default="verify_candidates.md",
+                    help="校验候选人读报告的输出路径（--verify off 时不写）")
     args = ap.parse_args()
 
     rec = WebRecorder(port=args.port)
@@ -887,6 +1115,18 @@ def main():
     if api_registry and api_registry.templates:
         _attach_t1_refs(tf, events, rec.network_capture.get_api_events(), api_registry)
 
+    # v3.6.0：录制时自动生成 verify 候选（只写录制中真实观测到的变化）
+    verify_adv = None
+    if VerifyAdvisor is not None and args.verify != "off":
+        verify_adv = VerifyAdvisor(mode=args.verify)
+        verify_adv.attach(tf, events)
+        report = verify_adv.render_report(args.out)
+        try:
+            with open(args.verify_report, "w", encoding="utf-8") as f:
+                f.write(report + "\n")
+        except Exception as e:
+            print("   ⚠️ 校验报告写入失败：%s" % e)
+
     js_lines = events_to_playwright(events)
 
     with open(args.out, "w", encoding="utf-8") as f:
@@ -906,6 +1146,13 @@ def main():
     if exported_elements:
         print("   - %s  （%d 个元素，多策略定位器）" % (args.elements, exported_elements))
     print("   - %s  （node 直接运行，需 playwright）" % args.js)
+    if verify_adv is not None:
+        n = verify_adv.report.get("applied", 0)
+        cand = verify_adv.report.get("candidates", 0)
+        print("   - %s  （自动生成校验：%d 步已写入 / 共推断 %d 条候选，模式 %s）"
+              % (args.verify_report, n, cand, args.verify))
+        if cand and not n:
+            print("      提示：候选都存在但未写入（多为中置信项），改用 --verify all 可启用")
 
 
 if __name__ == "__main__":

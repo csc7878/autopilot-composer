@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>APC 探测自检页</title>
+<style>
+  body { font-family: "Microsoft YaHei", sans-serif; padding: 24px; }
+  input { padding: 6px; width: 220px; }
+  button { padding: 8px 18px; margin-left: 8px; }
+  #toast { display: none; margin-top: 16px; padding: 10px 14px;
+           background: #e8f5e9; border: 1px solid #4caf50; }
+  .el-message { color: #2e7d32; }
+</style>
+</head>
+<body>
+  <h3>AutoPilot Composer 探测自检页</h3>
+  <p>客户编码：<input id="cust" name="customerCode" placeholder="请输入客户编码"></p>
+  <p><button id="save" type="button">保存</button></p>
+  <div id="toast"><span class="el-message">保存成功</span></div>
+
+  <script>
+    // 模拟真实的「点保存 → 出现提示」交互
+    document.getElementById('save').addEventListener('click', function () {
+      var t = document.getElementById('toast');
+      t.style.display = 'block';
+      // 3 秒后自动消失（模拟 toast 的瞬时性）
+      setTimeout(function () { t.style.display = 'none'; }, 3000);
+    });
+  </script>
+</body>
+</html>

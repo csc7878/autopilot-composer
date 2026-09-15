@@ -164,8 +164,14 @@ class ChatDriver:
     def _current_url(self):
         """从 CDP 取当前激活页面 URL。"""
         try:
-            import urllib.request, json as _json
-            with urllib.request.urlopen("http://127.0.0.1:%d/json" % self.port, timeout=3) as r:
+            import json as _json
+            # 绕过系统代理，否则 HTTP_PROXY 会让回环请求返回 502（详见 core/local_http.py）
+            try:
+                from core.local_http import urlopen_local
+            except ImportError:
+                import urllib.request as _ur
+                urlopen_local = _ur.urlopen
+            with urlopen_local("http://127.0.0.1:%d/json" % self.port, timeout=3) as r:
                 tabs = _json.load(r)
             for t in tabs:
                 if t.get("type") == "page":

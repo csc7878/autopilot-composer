@@ -31,7 +31,10 @@ class CdpBrowserCtrl:
 
     # ---------- 发现与连接 ----------
     def _list_targets(self):
-        with urllib.request.urlopen(self.http + "/json", timeout=5) as r:
+        # 用绕过代理的客户端：系统若配了 HTTP_PROXY，urllib 会把回环地址也送进代理
+        # 并返回 502，导致「Chrome 开着却连不上」且报错极具误导性。
+        from core.local_http import urlopen_local
+        with urlopen_local(self.http + "/json", timeout=5) as r:
             return json.load(r)
 
     def connect(self, target_type="page", url_filter=None):
