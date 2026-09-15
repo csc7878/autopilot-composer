@@ -18,7 +18,7 @@ def new_id(prefix="a"):
 class Action:
     def __init__(self, type, func, params=None, element_ref=None, text=None,
                  note="", ts=None, app="", domain="web",
-                 tier=None, credential_ref=None, t1_ref=None):
+                 tier=None, credential_ref=None, t1_ref=None, verify=None):
         if type not in ACTION_TYPES:
             raise ValueError("unknown action type: %s" % type)
         self.type = type
@@ -32,6 +32,7 @@ class Action:
         self.tier = tier                 # T1/T2/T3/T4 直连层标注
         self.credential_ref = credential_ref  # 凭证引用（不存明文凭证）
         self.t1_ref = t1_ref             # 录制时 Network 捕获的关联 T1 路径
+        self.verify = verify             # 结果校验规格（v3.4.1，见 core/verify.py）
         self.ts = ts or int(time.time() * 1000)
         self.id = new_id()
         self.status = "pending"          # pending | done | error
@@ -43,7 +44,7 @@ class Action:
             "text": self.text, "note": self.note, "app": self.app,
             "domain": self.domain, "ts": self.ts, "status": self.status,
             "tier": self.tier, "credential_ref": self.credential_ref,
-            "t1_ref": self.t1_ref,
+            "t1_ref": self.t1_ref, "verify": self.verify,
         }
 
     @classmethod
@@ -55,7 +56,8 @@ class Action:
         a = cls(d["type"], d["func"], params, d.get("element_ref"),
                 d.get("text"), d.get("note", ""), d.get("ts"),
                 d.get("app", ""), d.get("domain", "web"),
-                d.get("tier"), d.get("credential_ref"), d.get("t1_ref"))
+                d.get("tier"), d.get("credential_ref"), d.get("t1_ref"),
+                d.get("verify"))
         a.id = d.get("id", a.id)
         a.status = d.get("status", "pending")
         return a
@@ -72,11 +74,49 @@ def _clean_keys(keys):
     return out
 
 
+# 校验规格的一句话摘要（用于 comment / SOP 可读性）
+_VERIFY_BRIEF = {
+    "element_exists": lambda s: "元素出现 %s" % (s.get("selector") or s.get("query") or ""),
+    "element_absent": lambda s: "元素消失 %s" % (s.get("selector") or s.get("query") or ""),
+    "element_count": lambda s: "元素 %s 共 %s 个" % (s.get("selector") or s.get("query") or "",
+                                                    s.get("count", s.get("expected", 1))),
+    "text_present": lambda s: "页面含「%s」" % (s.get("text") or s.get("contains") or s.get("value") or ""),
+    "text_absent": lambda s: "页面不含「%s」" % (s.get("text") or s.get("contains") or s.get("value") or ""),
+    "url_contains": lambda s: "URL 含 %s" % (s.get("value") or s.get("url") or ""),
+    "url_equals": lambda s: "URL 等于 %s" % (s.get("value") or s.get("url") or ""),
+    "element_value_equals": lambda s: "%s 值等于 %s" % (s.get("selector") or s.get("query") or "",
+                                                       s.get("value") or ""),
+    "element_value_contains": lambda s: "%s 值含 %s" % (s.get("selector") or s.get("query") or "",
+                                                       s.get("value") or ""),
+    "window_title": lambda s: "窗口标题含 %s" % (s.get("value") or s.get("title") or ""),
+    "file_exists": lambda s: "文件已生成 %s" % (s.get("path") or ""),
+}
+
+
+def describe_verify(spec):
+    """把 verify 规格转成一句话（如「校验：页面含「保存成功」、元素消失 .loading」）。"""
+    items = spec if isinstance(spec, (list, tuple)) else ([spec] if spec else [])
+    parts = []
+    for s in items:
+        if not isinstance(s, dict):
+            continue
+        fn = _VERIFY_BRIEF.get(s.get("type", ""))
+        parts.append(fn(s) if fn else str(s.get("type", "?")))
+    return "校验：" + "、".join(parts) if parts else ""
+
+
 def describe_action(a, repo=None):
     """生成一步动作的可读描述（RPA 编辑器风格：动作 + 目标元素 + 参数）。
 
     同时用于 task_flow.json 的 `comment` 字段与 SOP.md 的步骤文案，保证两处一致。
+    v3.4.1：若该步带结果校验，描述末尾追加「校验：…」，让人一眼看出这步要验证什么。
     """
+    base = _describe_action_base(a, repo)
+    v = describe_verify(getattr(a, "verify", None))
+    return "%s  〔%s〕" % (base, v) if v else base
+
+
+def _describe_action_base(a, repo=None):
     func = a.func
     p = a.params
     el_name = ""
@@ -157,6 +197,8 @@ def actions_to_taskflow(actions, repo=None):
             step["credential_ref"] = a.credential_ref
         if a.t1_ref:
             step["t1_ref"] = a.t1_ref
+        if a.verify:
+            step["verify"] = a.verify
         step["comment"] = describe_action(a, repo)
         step["enabled"] = True
         steps.append(step)

@@ -6,6 +6,7 @@ import os
 import urllib.request
 
 from core.locator import is_xpath, WEB_PRIORITY
+from core.element_repo import record_locator_hit, record_locator_miss, ensure_locator_health
 
 
 class CdpBrowserCtrl:
@@ -154,31 +155,124 @@ class CdpBrowserCtrl:
         )
         return res.get("result", {}).get("value") or {"count": 0, "x": 0, "y": 0, "found": False}
 
-    def resolve_locator(self, element, priority=None):
+    # ---------- 校验辅助（供 core/verify.py 使用，v3.4.1） ----------
+
+    def element_count(self, selector):
+        """返回匹配该选择器的元素个数（CSS 与 XPath 均可）。异常时返回 -1。"""
+        try:
+            p = self._probe(selector)
+            return int(p.get("count", 0))
+        except Exception:
+            return -1
+
+    def current_url(self):
+        """返回当前页面的 location.href（失败返回空串）。"""
+        try:
+            res = self.send_cmd("Runtime.evaluate",
+                                {"expression": "location.href", "returnByValue": True})
+            return res.get("result", {}).get("value") or ""
+        except Exception:
+            return ""
+
+    def page_text(self, limit=200000):
+        """返回当前页面可见文本（document.body.innerText），失败返回空串。"""
+        try:
+            res = self.send_cmd(
+                "Runtime.evaluate",
+                {"expression": "(document.body && document.body.innerText) || ''",
+                 "returnByValue": True},
+            )
+            txt = res.get("result", {}).get("value") or ""
+            return txt[:limit]
+        except Exception:
+            return ""
+
+    def element_value(self, selector):
+        """返回元素的 value（输入框）或 innerText（其它），失败返回 None。"""
+        try:
+            expr = self._el_expr(selector)
+            js = ("(() => { const el = " + expr + ";"
+                  " if (!el) return null;"
+                  " return (el.value !== undefined && el.value !== null)"
+                  " ? String(el.value) : String(el.innerText || ''); })()")
+            res = self.send_cmd("Runtime.evaluate",
+                                {"expression": js, "returnByValue": True})
+            return res.get("result", {}).get("value")
+        except Exception:
+            return None
+
+    def resolve_locator(self, element, priority=None, record=True):
         """给定元素库里的元素 dict，按 priority 依次尝试各定位器。
 
         返回首个「能唯一匹配（count==1）」的 query；若都多匹配/未匹配，
         则 best-effort 返回第一个命中的 query；全失败返回 None。
         回放器据此在稳定性与可用性间自动权衡（对应影刀「智能元素」思路）。
+
+        v3.4.1 健康度跟踪（record=True 时生效，原地修改 element dict，由
+        ElementRepository.save() 落盘）：
+          - 命中（count==1）→ 该策略 hit+1、miss_streak 归零、复活 stale
+          - 未命中（found=false）→ 该策略 miss+1，连续 miss 达阈值即自动遗忘
+          - 多匹配（count>1）→ 不计分（语义模糊，既非命中也不宜判死）
+          - 已被自动遗忘的策略直接跳过，让位于更可靠的策略
         """
         if priority is None:
             priority = WEB_PRIORITY
         if not element:
             return None
-        locs = {l["strategy"]: l["query"] for l in element.get("locators", [])}
+        locs = {}
+        stale_strategies = set()
+        for l in element.get("locators", []):
+            ensure_locator_health(l)
+            locs[l["strategy"]] = l["query"]
+            if l.get("stale"):
+                stale_strategies.add(l["strategy"])
+
         best = None
+        best_strategy = None
+        best_all_stale = False
+
+        # 第一轮：正常策略（跳过已遗忘的）
         for strat in priority:
             q = locs.get(strat)
-            if not q:
+            if not q or (record and strat in stale_strategies):
                 continue
             try:
                 p = self._probe(q)
             except Exception:
+                if record:
+                    record_locator_miss(element, strat)
                 continue
             if p.get("found"):
                 if p.get("count") == 1:
+                    if record:
+                        record_locator_hit(element, strat)
                     return q
-                best = q
+                if best is None:
+                    best, best_strategy = q, strat
+            else:
+                if record:
+                    record_locator_miss(element, strat)
+
+        # 第二轮（兜底）：所有策略都已被遗忘时，仍按原顺序试一次
+        # ——「有线索总比没有好」，避免因自动遗忘导致整步直接失败
+        if best is None and record and stale_strategies:
+            for strat in priority:
+                q = locs.get(strat)
+                if not q or strat not in stale_strategies:
+                    continue
+                try:
+                    p = self._probe(q)
+                except Exception:
+                    continue
+                if p.get("found") and p.get("count") == 1:
+                    record_locator_hit(element, strat)
+                    return q
+                if p.get("found") and best is None:
+                    best, best_strategy, best_all_stale = q, strat, True
+
+        if best is not None and record and best_all_stale:
+            # 用了已遗忘的策略：刷新其 miss_streak 归零（避免来回抖动）
+            record_locator_hit(element, best_strategy)
         return best
 
     def input_text(self, selector, text):

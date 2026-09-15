@@ -2,7 +2,7 @@
 name: AutoPilot Composer
 displayName: AutoPilot Composer
 slug: autopilot-composer
-version: 3.4.0
+version: 3.4.1
 runtime: python
 tags:
   - automation
@@ -21,7 +21,10 @@ tags:
   - sql-direct
   - credential-manager
   - network-capture
-description: 桌面 GUI（pyautogui）+ 浏览器 CDP 双引擎 RPA，支持「录制→元素库→回放」原子动作建模、复用组件库、操作日志审计与流程挖掘、断点续跑与自动重试。v3.4.0 新增 T1 直连层（CLI/API/SQL），录制时自动捕获 UI 背后的 API 请求，回放时优先直调 API/CLI/SQL，失败自动降级到 GUI，对标影刀/UiPath 的企业级自动化能力。
+  - result-verify
+  - element-health
+  - self-healing
+description: 桌面 GUI（pyautogui）+ 浏览器 CDP 双引擎 RPA，支持「录制→元素库→回放」原子动作建模、复用组件库、操作日志审计与流程挖掘、断点续跑与自动重试。v3.4.0 新增 T1 直连层（CLI/API/SQL），录制时自动捕获 UI 背后的 API 请求，回放时优先直调 API/CLI/SQL，失败自动降级到 GUI。v3.4.1 新增步骤级结果校验（verify，不再「点完就算成功」）与元素库健康度自愈（定位器连续失败自动遗忘、元素复活）。对标影刀/UiPath 的企业级自动化能力。
 entry: ./scripts/main_task.py
 trigger:
   - 启动长任务自动化
@@ -334,6 +337,62 @@ python main_task.py
 | `error` | 某步多次重试失败，停在 current_step |
 | `finish` | 全部步骤执行完成 |
 
+## 8.5 结果校验（Verify）与元素库健康度（v3.4.1 新增）
+
+### 8.5.1 为什么需要「结果校验」
+
+重试机制只能发现「动作抛错」，发现不了「动作成功但没生效」——CSS 找得到按钮、CDP 点击也不报错，
+但页面可能弹了错误框、按钮是灰的、或后端拒绝了请求。这类问题以前要等到后面某步莫名失败才暴露，
+排查成本极高。v3.4.1 起，步骤可声明 `verify` 规格，**执行后校验是否真的生效**：
+
+```json
+{
+  "type": "browser", "func": "click_elem", "args": ["#btn-save"],
+  "verify": [
+    { "type": "text_present",   "text": "保存成功" },
+    { "type": "element_absent", "selector": ".loading-mask" }
+  ]
+}
+```
+
+校验不通过即按**失败**处理：重试 →（T1 路径则降级到 GUI）→ 仍不过则写断点暂停。
+
+支持的校验类型：
+
+| type | 必填字段 | 判定 |
+|------|----------|------|
+| `element_exists` | `selector` | 元素出现（count>0） |
+| `element_absent` | `selector` | 元素消失 |
+| `element_count` | `selector`+`count` | 元素个数相等 |
+| `text_present` / `text_absent` | `text` | 页面可见文本包含 / 不包含 |
+| `url_contains` / `url_equals` | `value` | 当前 URL 包含 / 等于 |
+| `element_value_equals` / `element_value_contains` | `selector`+`value` | 元素 value/innerText |
+| `window_title` | `value` | 前台窗口标题包含（桌面场景） |
+| `file_exists` | `path` | 文件已生成（导出/下载场景） |
+
+可选字段：`timeout`（该条校验轮询秒数，默认取 config 的 `verify_timeout`，应对异步渲染）。
+`verify` 可以是单个对象或数组（数组需全部通过）。浏览器未连接时网页类校验会标记为「跳过」而不误判失败。
+
+**常用配方**：保存/提交后校验 `text_present`「成功」；导出后校验 `file_exists`；
+登录后校验 `url_contains` 首页路径；查询后校验 `element_exists` 结果行选择器；
+点击后校验 `element_absent` 加载遮罩。详见 `docs/verify-and-health.md`。
+
+### 8.5.2 元素库健康度与自动遗忘
+
+回放时每个定位器的命中/未命中都会记账（v3.4.1）：
+
+- **定位器级**：某策略连续未命中达 `locator_stale_threshold`（默认 5）次 → 自动「遗忘」该策略，后续回放直接跳过（省探测时间，也不再让脆弱策略干扰）；
+- **元素级**：某元素连续未命中达 `stale_threshold`（默认 15）次 → 标记 `stale` 待复核（**不删除**，保留人工复核与恢复可能）；
+- **自愈**：任一命中即 `miss_streak` 归零、清除 `stale` —— 界面改版后又改回来也能自动恢复；
+- **兜底**：某元素全部策略都被遗忘时，回放会退回原顺序再试一遍 —— 有线索总比直接失败好。
+
+```bash
+python main_task.py --health          # 元素库体检报告（健康数/待复核数/最弱元素）
+python main_task.py --health-reset    # 人工复核后：恢复被自动遗忘的元素
+```
+
+统计结果随 `elements.json` 落盘（每 20 步落一次 + 结束/失败时落一次），不含预置元素库条目。
+
 ## 9. 配置项 `config.json`
 
 ```json
@@ -348,7 +407,9 @@ python main_task.py
   "run_mode": "background",
   "browser_cdp_port": 9222,
   "gui_safe_mode": true,
-  "task_flow_path": "./task_flow.json"
+  "task_flow_path": "./task_flow.json",
+  "verify_timeout": 5.0,
+  "verify_interval": 0.3
 }
 ```
 
@@ -358,6 +419,8 @@ python main_task.py
 | `delay_base` | 每步成功后等待秒数 |
 | `browser_cdp_port` | Chrome CDP 端口 |
 | `task_flow_path` | 任务流程文件路径 |
+| `verify_timeout` | 单条结果校验的轮询上限秒数（v3.4.1） |
+| `verify_interval` | 结果校验轮询间隔秒数（v3.4.1） |
 
 ## 10. 后台/静默运行
 
@@ -478,14 +541,15 @@ python scripts/chat_mode.py "回放"                          # 回放最近一�
 
 ## 16. 目录结构
 
-autopilot-composer-3.4.0/
+autopilot-composer-3.4.1/
 ├── SKILL.md                 # 本文档
 ├── docs/
-│   └── t1-direct-layer.md   # T1 直连层使用指南（API 模板/凭证管理/SQL 安全/Tier 降级）
+│   ├── t1-direct-layer.md   # T1 直连层使用指南（API 模板/凭证管理/SQL 安全/Tier 降级）
+│   └── verify-and-health.md # 结果校验 + 元素库健康度指南（配方与排错）
 ├── 小白使用说明.md           # 零基础快速上手手册
 ├── scripts/
-│   ├── main_task.py         # 任务编排入口（播放）
-│   ├── cdp_engine.py        # 浏览器 CDP 引擎（播放端，多策略定位 / URL 过滤连接标签页）
+│   ├── main_task.py         # 任务编排入口（播放 + 结果校验 + 健康度落盘 + --health/--reset）
+│   ├── cdp_engine.py        # 浏览器 CDP 引擎（播放端，多策略定位 / 定位器健康度记账 / 校验探针）
 │   ├── gui_engine.py        # 桌面 GUI 引擎（播放端）
 │   ├── recorder.py          # 网页录制器 v2（导出 task_flow + 元素库 + Playwright）+ InteractiveRecorder 实时确认
 │   ├── browser_launcher.py  # 自带浏览器启动 器（一键拉起 Chrome 调试实例）
@@ -494,14 +558,13 @@ autopilot-composer-3.4.0/
 │   ├── preset_elements.json # 预置元素库（常见站点多策略定位器）
 │   ├── desktop_recorder.py  #  * 桌面应用录制器
 │   ├── record_session.py    # 合并录制会话
-│   ├── demo2.html           # 自带浏览器验证页
-│   ├── e2e_preset_test.py   # 端到端验证脚本（自带浏览器+预置库+回放）
-│   ├── e2e_chat_test.py     # 端到端验证脚本（对话驱动+弹窗确认+回放）
+│   ├── e2e_v341_test.py     # v3.4.1 离线验证（结果校验 + 元素库健康度，33 项断言，免浏览器）
 │   ├── config.json / breakpoint.json / task_flow.json
 │   ├── core/                # 核心模块（actions / locator / observer / op_log / components / element_repo
 │   │                        #   + T1 直连层：api_client / api_registry / cli_executor / cli_registry /
 │   │                        #     db_client / db_registry / db_security / credential_manager /
-│   │                        #     network_capture / tier_resolver）
+│   │                        #     network_capture / tier_resolver
+│   │                        #   + 可靠性层：verify（结果校验器））
 │   └── requirements.txt
 
 
@@ -509,6 +572,7 @@ autopilot-composer-3.4.0/
 
 ## 17. 版本记录
 
+- **v3.4.1（2026-09-15）可靠性升级：结果校验 + 元素库自愈（不依赖 GPU / 纯 Python）**：机制灵感来自 GUI-Agent-Harness 的 Observe→**Verify**→Plan→Dispatch 循环与「视觉记忆自动遗忘」，但按本技能「低配 Windows + 零基础用户 + 确定性可审计」的定位做了取舍（不引入 VLM / PyTorch / Node 运行时）。① **步骤级结果校验**（新增 `core/verify.py`）——步骤可写 `verify` 规格，执行后校验「是否真的生效」而非默认成功，覆盖 11 种校验：`element_exists/element_absent/element_count/text_present/text_absent/url_contains/url_equals/element_value_equals/element_value_contains/window_title/file_exists`；支持数组（全部通过）、按 `timeout` 轮询应对异步渲染、浏览器未连接时标记「跳过」而不误判。校验不过按失败处理 → 重试 →（T1 路径则**降级到界面路径**，解决「接口返回 200 但界面没变化」）→ 仍不过则写断点暂停。② **元素库健康度 + 自动遗忘**（`core/element_repo.py` + `cdp_engine.resolve_locator`）——定位器级：某策略连续未命中达 5 次自动遗忘（跳过探测）；元素级：连续 15 次未命中标记 `stale` 待复核（不删除，保留人工复核）；**任一命中即复活**（界面改回原样可自愈）；全部策略被遗忘时兜底回退原顺序（有线索总比直接失败好）。③ **可观测性**——`python main_task.py --health` 打印体检报告（健康/待复核/最弱元素，区分「尚未回放过」），`--health-reset` 人工复核后一键恢复；校验失败会计入元素库 miss（把「定位器选错了」变成可归因数据）；统计每 20 步 + 结束/失败时落盘（`skip_presets` 不污染用户库）。④ **schema**——`Action` 新增 `verify` 字段（序列化往返 + 导出 task_flow），`describe_action` 的 `comment` 自动追加「〔校验：…〕」摘要；`config.json` 新增 `verify_timeout`/`verify_interval`。⑤ **离线验证** `scripts/e2e_v341_test.py`——33 项断言全过（免浏览器：健康度生命周期 A1-A14、定位器联动 B1-B5、11 种校验+调度 C1-C4、schema D1-D4、主流程集成 E1-E6，含「T1 成功但校验不过 → 自动降级 T2」）。⑥ **向后兼容**——旧 `elements.json` 自动补齐健康字段，无 `verify` 字段的流程行为完全不变（绝不让新机制误拦正常流程）。文档：新增 `docs/verify-and-health.md`，`小白使用说明.md` 升级 v3.4.1。
 - **3.1.0** 桌面 GUI + 浏览器 CDP 双引擎、断点续跑、自动重试、运行日志、后台静默运行。
 - **本次修订（2026-08-20）**：修复 `main_task.py` 缩进与重试循环；`cdp_engine.py` 改为 page 级 CDP 通道，适配 Chrome 111+ 的 `--remote-allow-origins=*` 要求；`task_flow` 支持外部 `task_flow.json` 配置。
 - **录制能力扩展（2026-08-22）**：网页录制器 v2 新增拖拽/悬停/键盘组合键/文件上传捕获，并支持跨域 iframe；新增桌面录制器与合并录制会话；播放端同步新增 `drag/hover/key_press/upload_file` 等回放方法。

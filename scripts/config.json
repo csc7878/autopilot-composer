@@ -12,5 +12,7 @@
   "task_flow_path": "./task_flow.json",
   "api_registry_path": "./api_registry.json",
   "cli_registry_path": "./cli_registry.json",
-  "db_registry_path": "./db_registry.json"
+  "db_registry_path": "./db_registry.json",
+  "verify_timeout": 5.0,
+  "verify_interval": 0.3
 }

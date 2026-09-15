@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""AutoPilot Composer —— 任务编排入口（播放器）【四层自动化升级版 v3.4.0】
+"""AutoPilot Composer —— 任务编排入口（播放器）【四层自动化 + 结果校验 v3.4.1】
 
 支持六类原子动作：
   - browser   : 浏览器 CDP 引擎（元素库解析 + 多策略定位回退）        T2/T4
@@ -17,6 +17,13 @@
 
 回放策略：每步先检查是否有 T1 路径，有则先试 T1（直调 API/CLI/SQL），
 T1 成功则跳过 GUI 操作；T1 失败自动降级到 T2/T3/T4。
+
+v3.4.1 新增两项可靠性机制：
+  1) 结果校验（Verify）：步骤可写 verify 规格，执行后校验「是否真的生效」，
+     未通过则按失败处理 → 重试 / T1 降级 / 断点暂停（见 core/verify.py）。
+  2) 元素库健康度 + 自动遗忘：定位器命中/未命中计数，连续失败的策略自动
+     stale（跳过），元素连续 15 次未命中标记待复核，任一命中即复活
+     （见 core/element_repo.py，用 `python main_task.py --health` 查看）。
 """
 import json
 import time
@@ -35,6 +42,7 @@ from core.tier_resolver import TierResolver
 from core.api_registry import ApiRegistry
 from core.cli_registry import CliRegistry
 from core.db_registry import DbRegistry
+from core.verify import Verifier
 
 
 logging.basicConfig(
@@ -64,6 +72,13 @@ class BreakPointTaskRunner:
             preset = ElementRepository.load_preset(preset_path)
             self.repo.merge(preset)
         self.oplog = OperationLog(self.cfg.get("oplog_path", "./operation_log.json"))
+        self.elements_path = elements_path
+        # 结果校验器（v3.4.1）：每步执行后校验是否真的生效
+        self.verifier = Verifier(browser=self.browser,
+                                 timeout=self.cfg.get("verify_timeout", 5.0),
+                                 interval=self.cfg.get("verify_interval", 0.3))
+        self._verify_count = 0        # 本次运行通过的校验项数
+        self._verify_skipped = 0
         comp_dir = self.cfg.get("components_dir",
                                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "components"))
         comp_mod.set_component_dir(comp_dir)
@@ -130,6 +145,32 @@ class BreakPointTaskRunner:
         return task_list
 
     # ---------------- 执行分发 ----------------
+    def _verify(self, action, step_info):
+        """执行步骤级结果校验（v3.4.1）。
+
+        校验未通过 → 抛 RuntimeError，由外层重试/降级逻辑接管：
+          - browser/gui 步骤：T1 路径的校验失败会触发降级到 T2/T3/T4
+          - 全部路径都失败 → 该步按失败处理，写入断点并暂停
+        校验失败同时视为「定位器选错了」的强信号，计入元素库 miss。
+        """
+        spec = getattr(action, "verify", None) or (step_info or {}).get("verify")
+        if not spec:
+            return None
+        res = self.verifier.check(spec, browser=self.browser)
+        if res.get("skipped"):
+            self._verify_skipped += 1
+            logging.info("步骤结果校验跳过：%s" % res.get("detail", ""))
+            return res
+        if not res.get("ok"):
+            # 校验不过 = 动作没生效：若走的是元素库定位，记一次 miss
+            if getattr(action, "element_ref", None):
+                self.repo.record_miss(action.element_ref,
+                                      getattr(action, "_resolved_strategy", None))
+            raise RuntimeError("结果校验未通过：%s" % res.get("detail", ""))
+        self._verify_count += len([r for r in res.get("results", []) if not r.get("skipped")])
+        logging.info("步骤结果校验通过：%s" % res.get("detail", ""))
+        return res
+
     def run_single_step(self, step_info):
         action = Action.from_dict(step_info)
         t0 = time.time()
@@ -137,21 +178,24 @@ class BreakPointTaskRunner:
             # T1 直连层优先：若步骤本身是 api/cli/sql，或 browser/gui 有 t1_ref
             if action.type in ("api", "cli", "sql"):
                 self._run_t1(action)
+                self._verify(action, step_info)
             elif action.type == "browser":
-                # 先试 T1（若有 t1_ref），成功则跳过 T2
+                # 先试 T1（若有 t1_ref），成功且校验通过则跳过 T2
                 if self.tier_resolver.has_t1(step_info):
                     t1_action = self.tier_resolver.resolve_t1(step_info)
                     if t1_action:
                         try:
                             self._run_t1(t1_action)
+                            self._verify(action, step_info)
                             dur = int((time.time() - t0) * 1000)
                             self.oplog.record(self.break_data.get("current_step", 0), action, "success", dur,
                                               extra={"tier": "T1", "t1_func": t1_action.func})
                             return True
                         except Exception as e:
                             logging.info("T1 降级 -> T2: %s" % e)
-                            # T1 失败，降级到 T2
+                            # T1 失败或校验不过，降级到 T2
                 self._run_browser(action)
+                self._verify(action, step_info)
             elif action.type == "gui":
                 # 同上：先试 T1，失败降级到 T3/T4
                 if self.tier_resolver.has_t1(step_info):
@@ -159,6 +203,7 @@ class BreakPointTaskRunner:
                     if t1_action:
                         try:
                             self._run_t1(t1_action)
+                            self._verify(action, step_info)
                             dur = int((time.time() - t0) * 1000)
                             self.oplog.record(self.break_data.get("current_step", 0), action, "success", dur,
                                               extra={"tier": "T1", "t1_func": t1_action.func})
@@ -166,6 +211,7 @@ class BreakPointTaskRunner:
                         except Exception as e:
                             logging.info("T1 降级 -> T3/T4: %s" % e)
                 self._run_gui(action)
+                self._verify(action, step_info)
             elif action.type == "component":
                 self._run_component(action)
             else:
@@ -182,16 +228,38 @@ class BreakPointTaskRunner:
             raise
 
     def _resolve_sel(self, action, fallback):
-        """若动作含 element_ref，到元素库解析最稳定位器；失败回退到内联选择器。"""
+        """若动作含 element_ref，到元素库解析最稳定位器；失败回退到内联选择器。
+
+        v3.4.1：解析结果计入元素库健康度——
+          - 命中 → record_hit（miss_streak 归零，复活已遗忘元素）
+          - 未命中 → record_miss（连续 miss 达阈值即标记 stale，回放时提示复核）
+        """
         if action.element_ref:
             el = self.repo.get(action.element_ref)
             if el:
+                if el.get("stale"):
+                    msg = "元素已标记待复核（连续未命中）：%s" % el.get("name", action.element_ref)
+                    logging.warning(msg)
+                    print("     \u26a0\ufe0f %s" % msg)
                 sel = self.browser.resolve_locator(el)
                 if sel:
                     self.repo.inc_used(action.element_ref)
+                    if self.repo.record_hit(action.element_ref):
+                        logging.info("元素 %s 已复活（重新命中）" % el.get("name", ""))
+                    # 记录本次实际选中的策略，供校验失败时归因
+                    action._resolved_strategy = self._strategy_of(el, sel)
                     return sel
+                self.repo.record_miss(action.element_ref)
                 logging.warning("元素库定位失败，回退内联选择器: %s" % action.element_ref)
         return fallback
+
+    @staticmethod
+    def _strategy_of(element, query):
+        """反查某 query 对应的定位器策略名（用于健康度归因）。"""
+        for l in element.get("locators", []) or []:
+            if l.get("query") == query:
+                return l.get("strategy")
+        return None
 
     @staticmethod
     def _clean_keys(keys):
@@ -343,6 +411,13 @@ class BreakPointTaskRunner:
         else:
             raise RuntimeError("组件 %s 不支持的语言: %s" % (name, lang))
 
+    def _save_repo(self):
+        """把元素库健康度落盘（不写入预置库条目）。"""
+        try:
+            self.repo.save(skip_presets=True)
+        except Exception as e:
+            logging.warning("元素库落盘失败: %s" % e)
+
     def start_run(self):
         task_flow = self.load_task_flow()
         start_idx = self.break_data["current_step"]
@@ -369,6 +444,8 @@ class BreakPointTaskRunner:
                     success = True
                     self.save_breakpoint(idx + 1, "running")
                     print("  \u2705 \u6b65\u9aa4 %d/%d  [%s] {%s}" % (idx + 1, len(task_flow), desc, tier))
+                    if step.get("verify"):
+                        print("     \u2714 \u7ed3\u679c\u6821\u9a8c\u901a\u8fc7")
                     time.sleep(self.cfg["delay_base"])
                     logging.info("步骤%d执行成功" % idx)
                     break
@@ -377,17 +454,34 @@ class BreakPointTaskRunner:
                     err_info = "步骤%d异常：%s" % (idx, str(e))
                     logging.error(err_info)
                     print("  \u26a0\ufe0f \u6b65\u9aa4 %d/%d  [%s] {%s} \u91cd\u8bd5 %d/%d\uff1a%s"
-                          % (idx + 1, len(task_flow), desc, tier, retry, self.max_retry, str(e)[:60]))
+                          % (idx + 1, len(task_flow), desc, tier, retry, self.max_retry, str(e)[:80]))
                     time.sleep(2)
+            # 每 20 步落盘一次元素库健康度，避免中途崩溃丢失统计
+            if (idx + 1) % 20 == 0:
+                self._save_repo()
             if not success:
                 self.save_breakpoint(idx, "error", err_info)
                 self.oplog.save()
+                self._save_repo()
                 print("\n❌ 步骤 %d 多次重试失败，任务暂停。可用 `python main_task.py --reset` 重置后重跑。" % (idx + 1))
                 print("   失败详情已写入 run_log.log")
                 return
         self.save_breakpoint(0, "finish")
         self.oplog.save()
+        self._save_repo()
         print("\n🎉 全部 %d 步执行完成。" % len(task_flow))
+        if self._verify_count or self._verify_skipped:
+            print("   \u7ed3\u679c\u6821\u9a8c\uff1a\u901a\u8fc7 %d \u9879\uff0c\u8df3\u8fc7 %d \u9879"
+                  % (self._verify_count, self._verify_skipped))
+        # 元素库健康度提醒（自动遗忘的条目需人工复核）
+        try:
+            hr = self.repo.health_report()
+            if hr["stale"]:
+                print("   ⚠️ 元素库有 %d 个元素被自动遗忘（连续未命中），可执行 "
+                      "`python main_task.py --health` 查看详情、`--health-reset` 复核后恢复。"
+                      % hr["stale"])
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
@@ -400,5 +494,43 @@ if __name__ == "__main__":
             print("已重置断点，将从第 0 步重新回放。")
         else:
             print("无断点文件，直接从头回放。")
+
+    # --health：打印元素库健康度报告后退出（不跑流程）
+    # --health-reset：把被自动遗忘的元素恢复为可用（人工复核后使用）
+    if "--health" in sys.argv or "--health-reset" in sys.argv:
+        cfg = {}
+        try:
+            with open("config.json", "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            pass
+        elements_path = cfg.get("elements_path", "./elements.json")
+        repo = ElementRepository.load(elements_path)
+        if "--health-reset" in sys.argv:
+            n = repo.reset_health(only_stale=True)
+            repo.save(skip_presets=True)
+            print("已恢复 %d 个被自动遗忘的元素（miss_streak 归零）。" % n)
+        hr = repo.health_report()
+        print("\n元素库健康度：共 %d 个元素，%d 个正常，%d 个待复核"
+              % (hr["total"], hr["healthy"], hr["stale"]))
+        if hr.get("never_used"):
+            print("（其中 %d 个尚未回放过，不计入问题元素）" % hr["never_used"])
+        if hr.get("dead_locator_elements"):
+            print("定位器自动遗忘：%d 个元素有策略被跳过" % hr["dead_locator_elements"])
+        if hr["weakest"]:
+            print("\n最需要关注的元素（按连续未命中排序）：")
+            for w in hr["weakest"]:
+                nm = w["name"][:28] + ("…" if len(w["name"]) > 28 else "")
+                dead = ("，已跳过策略：" + ",".join(w["stale_locators"])) if w["stale_locators"] else ""
+                print("  - %s（%s）命中 %d 次、连续未命中 %d 次，定位器 %d 个%s"
+                      % (nm, w["domain"] or "-", w["hit_count"],
+                         w["miss_streak"], w["locators"], dead))
+        else:
+            print("暂无失败记录（回放过至少一次后才会产生健康数据）。")
+        if hr["stale"]:
+            print("\n提示：被自动遗忘的元素在回放时会跳过对应定位器，"
+                  "确认界面已恢复后执行 `python main_task.py --health-reset` 复活。")
+        sys.exit(0)
+
     runner = BreakPointTaskRunner()
     runner.start_run()
